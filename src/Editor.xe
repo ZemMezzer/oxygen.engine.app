@@ -1,0 +1,1139 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+struct Editor
+{
+    public Document Document;
+    public Camera Camera;
+    public GameWorld *Game;
+    public float[] UI;
+    public float[] Ray;
+    public int[] PlaySlots;
+    public int Brush;
+    public int GizmoMode;
+    public int Layer;
+    public float Rotation;
+    public int Selected;
+    public int Texture;
+    public int Checker;
+    public bool Stroke;
+    public bool Changed;
+    public bool Playing;
+    public bool Grid;
+    public bool Flying;
+    public int LastCell;
+    public bool Quit;
+    public float[] TransformBefore;
+    public int TransformRoot;
+
+    public Editor()
+    {
+        Document = Document();
+        Camera = Camera();
+        Camera.Position = Vector3(15.0f, 14.0f, 19.0f);
+        Camera.Yaw = -0.65f;
+        Camera.Pitch = -0.53f;
+        UI = new float[32];
+        TransformBefore = new float[RecordSize];
+        TransformRoot = -1;
+        Ray = new float[6];
+        PlaySlots = new int[Capacity];
+        Brush = 1;
+        GizmoMode = 1;
+        Selected = -1;
+        Grid = true;
+        LastCell = -1;
+        Checker = CheckerTexture(128, 2, 0xCFD9E0FFu, 0x929FAAFFu);
+        Document.Starter();
+
+        if (ed_load(&Document.Data[0], Capacity, 1) != 0)
+        {
+            Document.ResetHistory();
+        }
+    }
+
+    public ~Editor()
+    {
+        FinishGizmo(true);
+        if (Game != null)
+        {
+            delete (Game);
+        }
+
+        ReleaseTexture(Checker);
+        delete (Ray);
+        delete (PlaySlots);
+        delete (UI);
+        delete (TransformBefore);
+    }
+
+    public void FinishStroke()
+    {
+        if (Changed)
+        {
+            Document.Commit();
+        }
+
+        Changed = false;
+        Stroke = false;
+        LastCell = -1;
+    }
+
+    public void RememberTransform()
+    {
+        TransformRoot = Selected;
+        for (int i = 0; i < RecordSize; i++)
+        {
+            TransformBefore[i] = Document.Data[i];
+        }
+    }
+
+    public void FollowTransform()
+    {
+        Document.FollowTransform(&TransformBefore[0], TransformRoot);
+        if (ed_validate_scene(&Document.Data[0]) == 0)
+        {
+            for (int i = 0; i < RecordSize; i++)
+            {
+                Document.Data[i] = TransformBefore[i];
+            }
+            ed_status("Transform cancelled: the hierarchy would exceed scene limits.");
+        }
+    }
+
+    public void FinishGizmo(bool cancel)
+    {
+        int value = 0;
+        if (cancel)
+        {
+            value = 1;
+        }
+        int result = ed_gizmo_finish(value);
+        if (result != 0)
+        {
+            if (cancel)
+            {
+                for (int i = 0; i < RecordSize; i++)
+                {
+                    Document.Data[i] = TransformBefore[i];
+                }
+            }
+            else
+            {
+                FollowTransform();
+            }
+            if (result == 2)
+            {
+                Document.Commit();
+            }
+        }
+    }
+
+    public bool Save(bool another)
+    {
+        FinishGizmo(false);
+        FinishStroke();
+        int result = 0;
+
+        if (another)
+        {
+            result = ed_save_as(&Document.Data[0], Capacity);
+        }
+        else
+        {
+            result = ed_save(&Document.Data[0], Capacity);
+        }
+
+        if (result != 0)
+        {
+            Document.Dirty = false;
+        }
+
+        return result != 0;
+    }
+
+    public bool MayLeave()
+    {
+        FinishGizmo(true);
+        FinishStroke();
+        int dirty = 0;
+        if (Document.Dirty || ed_gizmo_active() != 0)
+        {
+            dirty = 1;
+        }
+        int answer = ed_guard(dirty);
+        if (answer == 2)
+        {
+            return Save(false);
+        }
+        return answer == 1;
+    }
+
+    public void FillUI()
+    {
+        for (int i = 0; i < 32; i++)
+        {
+            UI[i] = 0.0f;
+        }
+        UI[20] = cast<float>(GizmoMode);
+        UI[0] = cast<float>(Brush);
+        UI[1] = cast<float>(Layer);
+        UI[2] = Rotation;
+        UI[3] = cast<float>(Selected);
+        UI[4] = cast<float>(Document.Count());
+        if (Document.Dirty || ed_gizmo_active() != 0)
+        {
+            UI[5] = 1.0f;
+        }
+        if (Playing)
+        {
+            UI[6] = 1.0f;
+        }
+        if (Document.Cursor > 0)
+        {
+            UI[18] = 1.0f;
+        }
+        if (Document.Cursor + 1 < Document.HistoryCount)
+        {
+            UI[19] = 1.0f;
+        }
+
+        if (Selected >= 0)
+        {
+            int at = Selected * Stride;
+            UI[22] = Document.Data[at + 12];
+            UI[23] = Document.Data[at + 13];
+            UI[7] = Document.Data[at];
+
+            for (int i = 0; i < 7; i++)
+            {
+                UI[8 + i] = Document.Data[at + 1 + i];
+            }
+            UI[15] = Document.Data[at + 10];
+            UI[16] = Document.Data[at + 11];
+        }
+    }
+
+    public void Stop()
+    {
+        if (Game != null)
+        {
+            delete (Game);
+        }
+        Game = null;
+        Playing = false;
+        ed_capture(0);
+        ed_stop_sound();
+        ed_status("Returned to editing. Play-mode changes were discarded.");
+    }
+
+    public void Play()
+    {
+        FinishGizmo(false);
+        FinishStroke();
+        Game = new GameWorld();
+        Scene *scene = new Scene(1, Capacity);
+        scene->Ambient = Vector3(0.3f, 0.32f, 0.36f);
+        scene->AddLight(Light(0, Vector3(-0.4f, -1.0f, -0.3f), 0xE0EEFFFFu, 0.7f, 1.0f));
+        scene->BindTexture(1, Checker);
+        Vector3 spawn = Vector3(1.0f, 0.05f, 5.0f);
+        float yaw = 0.0f;
+        int textureSlot = 2;
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            PlaySlots[i] = -1;
+            int kind = cast<int>(Document.Data[at]);
+            if (kind == 0)
+            {
+                continue;
+            }
+            Vector3 origin = Vector3(Document.Data[at + 1], Document.Data[at + 2], Document.Data[at + 3]);
+
+            if (kind == 9)
+            {
+                spawn = Add(origin, Vector3(0.0f, 0.05f, 0.0f));
+                yaw = Document.Data[at + 4] * Pi / 180.0f;
+                continue;
+            }
+
+            if (kind == 7)
+            {
+                scene->AddLight(Light(1, origin, Palette(cast<int>(Document.Data[at + 9])),
+                                      Document.Data[at + 11], 12.0f));
+                continue;
+            }
+
+            if (kind == 8)
+            {
+                continue;
+            }
+            Primitive value = MakePrimitive(&Document.Data[0], i);
+            value.Tag = i + 1;
+            int motion = cast<int>(Document.Data[at + 10]);
+            value.Physics.Motion = BodyStatic;
+            if (motion == 1)
+            {
+                value.Physics.Motion = BodyDynamic;
+                value.Physics.Mass = 4.0f;
+            }
+            if (motion == 2)
+            {
+                value.Physics.Motion = BodyNone;
+            }
+            int asset = cast<int>(Document.Data[at + 8]);
+
+            if (kind == 1 && asset == 0)
+            {
+                value.Material.TextureSlot = 1;
+            }
+            if (ed_asset_kind(asset) == 1 && textureSlot < 64)
+            {
+                scene->BindTexture(textureSlot, ed_asset_handle(asset));
+                value.Material.TextureSlot = textureSlot++;
+            }
+
+            // Imported models use an explicit bounding-box collision approximation in this iteration.
+            if (kind == 6)
+            {
+                value.Material.Color = 0xFFFFFFFFu;
+            }
+            int slot = scene->FreeSlot();
+            if (scene->Add(value) != 0)
+            {
+                PlaySlots[i] = slot;
+            }
+        }
+
+        Game->AddRoom(scene);
+
+        if (!Game->Start(1, spawn))
+        {
+            Stop();
+            ed_status("Player start is obstructed. Move the Player start marker to a free floor tile.");
+            return;
+        }
+
+        Game->View.Yaw = yaw;
+        Playing = true;
+        ed_capture(1);
+        ed_status("PLAY: WASD movement / mouse look / Space jump / E push / Esc stop.");
+    }
+
+    public void Action(int action)
+    {
+        if (action == 0)
+        {
+            return;
+        }
+        FinishGizmo(false);
+        FinishStroke();
+        if (action == 99)
+        {
+            Quit = true;
+            return;
+        }
+
+        if (action >= 80 && action <= 82)
+        {
+            Brush = 0;
+            GizmoMode = action - 79;
+            ed_status("Drag a colored handle. Ctrl snaps; Esc cancels. Scale uses local axes.");
+            return;
+        }
+
+        if (action == 6)
+        {
+            if (Playing)
+            {
+                Stop();
+            }
+            else
+            {
+                Play();
+            }
+            return;
+        }
+
+        if (Playing)
+        {
+            return;
+        }
+
+        if (action == 91)
+        {
+            int copy = Document.Duplicate(Selected);
+            if (copy >= 0)
+            {
+                Selected = copy;
+                Brush = 0;
+                Document.Commit();
+            }
+            return;
+        }
+        if (action == 92)
+        {
+            if (Document.Reparent(ed_parent_source(), ed_parent_target()))
+            {
+                Document.Commit();
+            }
+            return;
+        }
+        if (action == 90 && Selected >= 0)
+        {
+            float[] values = new float[9];
+            if (ed_transform_values(&values[0]) != 0)
+            {
+                RememberTransform();
+                int at = Selected * Stride;
+                for (int i = 0; i < 3; i++)
+                {
+                    Document.Data[at + 1 + i] = values[i];
+                    Document.Data[at + 5 + i] = values[6 + i];
+                }
+                Document.Data[at + 12] = values[3];
+                Document.Data[at + 4] = values[4];
+                Document.Data[at + 13] = values[5];
+                FollowTransform();
+                bool changed = false;
+                for (int i = 0; i < RecordSize; i++)
+                {
+                    if (Document.Data[i] != TransformBefore[i])
+                    {
+                        changed = true;
+                    }
+                }
+                if (changed)
+                {
+                    Document.Commit();
+                }
+            }
+            delete (values);
+            return;
+        }
+
+        if (action == 1 || action == 2)
+        {
+            if (!MayLeave())
+            {
+                return;
+            }
+            int create = 0;
+            if (action == 1)
+            {
+                create = 1;
+            }
+
+            if (ed_project(create) != 0)
+            {
+                Texture = 0;
+                Selected = -1;
+                Document.Starter();
+                ed_load(&Document.Data[0], Capacity, 1);
+                Document.ResetHistory();
+            }
+        }
+
+        if (action == 3)
+        {
+            Save(false);
+        }
+        if (action == 13)
+        {
+            Save(true);
+        }
+
+        if (action == 4 && MayLeave())
+        {
+            if (ed_load(&Document.Data[0], Capacity, 0) != 0)
+            {
+                Selected = -1;
+                Document.ResetHistory();
+                Document.Dirty = false;
+            }
+        }
+
+        if (action == 5 && MayLeave())
+        {
+            for (int i = 0; i < RecordSize; i++)
+            {
+                Document.Data[i] = 0.0f;
+            }
+            Selected = -1;
+            ed_new_scene();
+            Document.ResetHistory();
+            Document.Dirty = true;
+        }
+
+        if (action == 7)
+        {
+            Document.Restore(Document.Cursor - 1);
+            Selected = -1;
+        }
+        if (action == 8)
+        {
+            Document.Restore(Document.Cursor + 1);
+            Selected = -1;
+        }
+        if (action == 9)
+        {
+            ed_import(0);
+        }
+        if (action == 10)
+        {
+            ed_import(1);
+        }
+        if (action == 12)
+        {
+            ed_sound(ed_asset_id(), 0.7f);
+        }
+        if (action >= 20 && action <= 30)
+        {
+            Brush = action - 20;
+        }
+        if (action == 40)
+        {
+            Layer = cast<int>(Max(0.0f, cast<float>(Layer - 1)));
+        }
+        if (action == 41)
+        {
+            Layer = cast<int>(Min(15.0f, cast<float>(Layer + 1)));
+        }
+        if (action == 42)
+        {
+            Rotation += 90.0f;
+            if (Rotation >= 360.0f)
+            {
+                Rotation = 0.0f;
+            }
+        }
+        if (action == 70)
+        {
+            Selected = ed_hierarchy_selection();
+            Brush = 0;
+        }
+
+        if (action == 71)
+        {
+            int kind = ed_asset_kind(ed_asset_id());
+            if (kind == 1)
+            {
+                Texture = ed_asset_id();
+                Brush = 1;
+            }
+            if (kind == 2)
+            {
+                Brush = 6;
+            }
+            if (kind == 3)
+            {
+                Brush = 8;
+            }
+        }
+
+        if (Selected < 0 || action < 50 || action > 64)
+        {
+            return;
+        }
+        int at = Selected * Stride;
+        RememberTransform();
+        bool changed = true;
+
+        if (action == 50)
+        {
+            Document.Remove(Selected);
+            Selected = -1;
+        }
+        if (action >= 51 && action <= 56)
+        {
+            int axis = (action - 51) / 2;
+            float step = -0.25f;
+            if (action % 2 == 0)
+            {
+                step = 0.25f;
+            }
+            Document.Data[at + 1 + axis] += step;
+        }
+
+        if (action == 57)
+        {
+            Document.Data[at + 4] += 90.0f;
+        }
+        if (action == 58 || action == 59)
+        {
+            float scale = 0.8f;
+            if (action == 59)
+            {
+                scale = 1.25f;
+            }
+            for (int i = 5; i <= 7; i++)
+            {
+                Document.Data[at + i] = Clamp(Document.Data[at + i] * scale, 0.02f, 1000.0f);
+            }
+        }
+
+        if (action == 60)
+        {
+            Document.Data[at + 10] = cast<float>((cast<int>(Document.Data[at + 10]) + 1) % 3);
+        }
+        if (action == 61)
+        {
+            Document.Data[at + 11] = Max(0.0f, Document.Data[at + 11] - 0.1f);
+        }
+        if (action == 62)
+        {
+            float maximum = 32.0f;
+            if (Document.Data[at] == 8.0f)
+            {
+                maximum = 1.0f;
+            }
+            Document.Data[at + 11] = Min(maximum, Document.Data[at + 11] + 0.1f);
+        }
+        if (action == 63)
+        {
+            if (ed_asset_kind(ed_asset_id()) == 1 && Document.Data[at] <= 5.0f)
+            {
+                Document.Data[at + 8] = cast<float>(ed_asset_id());
+            }
+            else
+            {
+                changed = false;
+                ed_status("Select a texture and a primitive tile first.");
+            }
+        }
+
+        if (action == 64)
+        {
+            Vector3 center =
+                Vector3(Document.Data[at + 1], Document.Data[at + 2] + 1.0f, Document.Data[at + 3]);
+            Camera.Position = Subtract(center, Scale(Camera.Forward(), 7.0f));
+            changed = false;
+        }
+
+        if (changed)
+        {
+            if (action >= 51 && action <= 59)
+            {
+                FollowTransform();
+            }
+            Document.Commit();
+        }
+    }
+
+    public int Pick()
+    {
+        int selected = -1;
+        float nearest = 10000.0f;
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            if (Document.Data[at] == 0.0f)
+            {
+                continue;
+            }
+            float distance = 0.0f;
+
+            if (ed_pick(&Ray[0], Document.Data[at + 1], Document.Data[at + 2], Document.Data[at + 3],
+                        Document.Data[at + 5], Document.Data[at + 6], Document.Data[at + 7],
+                        Document.Data[at + 4], Document.Data[at + 12], Document.Data[at + 13],
+                        &distance) != 0 &&
+                distance < nearest)
+            {
+                selected = i;
+                nearest = distance;
+            }
+        }
+
+        return selected;
+    }
+
+    public bool CellPoint(Vector3 *result)
+    {
+        if (Abs(Ray[4]) < 0.0001f)
+        {
+            return false;
+        }
+        float t = (cast<float>(Layer) * 2.0f - Ray[1]) / Ray[4];
+        if (t < 0.0f || t > 200.0f)
+        {
+            return false;
+        }
+        float x = Ray[0] + Ray[3] * t;
+        float z = Ray[2] + Ray[5] * t;
+        if (x < -32.0f || x >= 32.0f || z < -32.0f || z >= 32.0f)
+        {
+            return false;
+        }
+        // Add a positive origin before integer conversion so negative cells floor correctly.
+        result->X = cast<float>(cast<int>((x + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+        result->Y = cast<float>(Layer) * 2.0f;
+        result->Z = cast<float>(cast<int>((z + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+        return true;
+    }
+
+    public void Update(float dt)
+    {
+        if (Playing)
+        {
+            if (Pressed(KeyEscape) || Pressed(294))
+            {
+                Stop();
+                return;
+            }
+            PlayerInput input = PlayerInput();
+            if (EditorKeyDown(KeyW))
+            {
+                input.Forward += 1.0f;
+            }
+            if (EditorKeyDown(KeyS))
+            {
+                input.Forward -= 1.0f;
+            }
+            if (EditorKeyDown(KeyD))
+            {
+                input.Side += 1.0f;
+            }
+            if (EditorKeyDown(KeyA))
+            {
+                input.Side -= 1.0f;
+            }
+            input.LookX = ed_look(0) * 0.0025f;
+            input.LookY = -ed_look(1) * 0.0025f;
+            input.Jump = Pressed(KeySpace);
+            Game->Update(input, dt);
+            for (int i = 0; i < Capacity; i++)
+            {
+                int at = i * Stride;
+                if (Document.Data[at] == 8.0f)
+                {
+                    Vector3 position =
+                        Vector3(Document.Data[at + 1], Document.Data[at + 2], Document.Data[at + 3]);
+                    float volume =
+                        Document.Data[at + 11] *
+                        Clamp(1.0f - Length(Subtract(position, Game->View.Position)) / 12.0f, 0.0f, 1.0f);
+                    ed_voice(i, cast<int>(Document.Data[at + 8]), volume);
+                }
+            }
+            if (Pressed(69))
+            {
+                Game->Push(5.0f, 12.0f);
+            }
+            if (Game->View.Position.Y < -50.0f)
+            {
+                Stop();
+                ed_status("Player fell out of the map. Add floor tiles or move the spawn marker.");
+            }
+            return;
+        }
+
+        // A drag is one transaction. Camera motion, selection and document commands wait for release.
+        if (ed_gizmo_active() != 0)
+        {
+            Vector3 direction = Camera.Forward();
+            ed_ray(&Ray[0], Camera.Position.X, Camera.Position.Y, Camera.Position.Z, direction.X, direction.Y,
+                   direction.Z, Camera.VerticalFov);
+            int cancel = 0;
+            if (Pressed(KeyEscape))
+            {
+                cancel = 1;
+            }
+            int result = ed_gizmo_update(&Document.Data[Selected * Stride], GizmoMode, ed_control(), cancel);
+            if (result == 4)
+            {
+                for (int i = 0; i < RecordSize; i++)
+                {
+                    Document.Data[i] = TransformBefore[i];
+                }
+            }
+            else
+            {
+                FollowTransform();
+            }
+            if (result == 2)
+            {
+                Document.Commit();
+            }
+            return;
+        }
+
+        if (ed_input_blocked() != 0)
+        {
+            return;
+        }
+        bool control = ed_control() != 0;
+        if (control && Pressed(68))
+        {
+            Action(91);
+        }
+        if (control && Pressed(83))
+        {
+            Action(3);
+        }
+        if (control && Pressed(90))
+        {
+            Action(7);
+        }
+        if (control && Pressed(89))
+        {
+            Action(8);
+        }
+        if (Pressed(294))
+        {
+            Action(6);
+            return;
+        }
+        if (Pressed(86))
+        {
+            Brush = 0;
+        }
+        bool navigation = ed_mouse(4) != 0 || Flying;
+        if (!control && !navigation)
+        {
+            if (Pressed(87))
+            {
+                Action(80);
+            }
+            if (Pressed(69))
+            {
+                Action(81);
+            }
+            if (Pressed(82))
+            {
+                if (Brush == 0)
+                {
+                    Action(82);
+                }
+                else
+                {
+                    Action(42);
+                }
+            }
+        }
+        if (Pressed(91))
+        {
+            Action(40);
+        }
+        if (Pressed(93))
+        {
+            Action(41);
+        }
+        if (Pressed(261))
+        {
+            Action(50);
+        }
+        if (Pressed(70))
+        {
+            Action(64);
+        }
+        bool inside = ed_mouse(0) != 0;
+        bool flying = ed_mouse(4) != 0 && (inside || Flying);
+
+        if (flying != Flying)
+        {
+            Flying = flying;
+            int capture = 0;
+            if (flying)
+            {
+                capture = 1;
+            }
+            ed_capture(capture);
+        }
+
+        if (Flying)
+        {
+            FinishStroke();
+            Camera.Look(ed_look(0) * 0.003f, -ed_look(1) * 0.003f);
+            Camera.Pitch = Clamp(Camera.Pitch, -1.52f, 1.52f);
+            Vector3 movement = Vector3(0.0f, 0.0f, 0.0f);
+            if (EditorKeyDown(KeyW))
+            {
+                movement = Add(movement, Camera.Forward());
+            }
+            if (EditorKeyDown(KeyS))
+            {
+                movement = Subtract(movement, Camera.Forward());
+            }
+            if (EditorKeyDown(KeyD))
+            {
+                movement = Add(movement, Camera.Right());
+            }
+            if (EditorKeyDown(KeyA))
+            {
+                movement = Subtract(movement, Camera.Right());
+            }
+            if (EditorKeyDown(69))
+            {
+                movement.Y += 1.0f;
+            }
+            if (EditorKeyDown(81))
+            {
+                movement.Y -= 1.0f;
+            }
+            float speed = 10.0f;
+            if (EditorKeyDown(340))
+            {
+                speed = 24.0f;
+            }
+            Camera.Position = Add(Camera.Position, Scale(movement, dt * speed));
+            return;
+        }
+
+        Camera.Position = Add(Camera.Position, Scale(Camera.Forward(), ed_wheel() * 1.5f));
+        Vector3 forward = Camera.Forward();
+        ed_ray(&Ray[0], Camera.Position.X, Camera.Position.Y, Camera.Position.Z, forward.X, forward.Y,
+               forward.Z, Camera.VerticalFov);
+        if (ed_mouse(3) != 0)
+        {
+            FinishStroke();
+        }
+        if (Brush == 0 && Selected >= 0)
+        {
+            if (ed_mouse(1) != 0)
+            {
+                RememberTransform();
+            }
+            int result = ed_gizmo_update(&Document.Data[Selected * Stride], GizmoMode, ed_control(), 0);
+            if (result != 0)
+            {
+                FollowTransform();
+            }
+            if (result == 2)
+            {
+                Document.Commit();
+            }
+            if (result != 0)
+            {
+                return;
+            }
+        }
+
+        if (!inside || control)
+        {
+            return;
+        }
+
+        if (Brush == 0)
+        {
+            if (ed_mouse(1) != 0)
+            {
+                Selected = Pick();
+            }
+            return;
+        }
+
+        if (ed_mouse(1) != 0)
+        {
+            Stroke = true;
+        }
+        if (!Stroke || ed_mouse(2) == 0)
+        {
+            return;
+        }
+        Vector3 cell = Vector3(0.0f, 0.0f, 0.0f);
+        if (!CellPoint(&cell))
+        {
+            return;
+        }
+        if (LastCell >= 0 && LastCell / 4096 == Layer)
+        {
+            Vector3 previous = Vector3(cast<float>(LastCell % 64) - 32.0f, cell.Y,
+                                       cast<float>((LastCell / 64) % 64) - 32.0f);
+            int steps = cast<int>(Max(Abs(cell.X - previous.X), Abs(cell.Z - previous.Z)) * 0.5f);
+
+            for (int i = 1; i < steps; i++)
+            {
+                Vector3 point =
+                    Add(previous, Scale(Subtract(cell, previous), cast<float>(i) / cast<float>(steps)));
+                point.X = cast<float>(cast<int>((point.X + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+                point.Z = cast<float>(cast<int>((point.Z + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+                PaintCell(point);
+            }
+        }
+
+        PaintCell(cell);
+    }
+
+    public void PaintCell(Vector3 cell)
+    {
+        int key = cast<int>(cell.X + 32.0f) + cast<int>(cell.Z + 32.0f) * 64 + Layer * 4096;
+        if (LastCell == key)
+        {
+            return;
+        }
+        LastCell = key;
+        int existing = Document.Cell(cell.X, cell.Y, cell.Z, Brush);
+
+        if (Brush == 10)
+        {
+            if (existing >= 0)
+            {
+                Document.Remove(existing);
+                Changed = true;
+                Selected = -1;
+            }
+            return;
+        }
+
+        int asset = Texture;
+        if (Brush == 6 || Brush == 8)
+        {
+            asset = ed_asset_id();
+            int expected = 2;
+            if (Brush == 8)
+            {
+                expected = 3;
+            }
+            if (ed_asset_kind(asset) != expected)
+            {
+                ed_status("Select a matching model or sound in Resources first.");
+                return;
+            }
+        }
+        if (Brush >= 7 && Brush != 8)
+        {
+            asset = 0;
+        }
+
+        // Props do not erase the supporting floor; structural tiles replace the cell.
+        if (existing >= 0 && Brush <= 5)
+        {
+            Document.Remove(existing);
+        }
+        if (Brush == 9)
+        {
+            for (int i = 0; i < Capacity; i++)
+            {
+                if (Document.Data[i * Stride] == 9.0f)
+                {
+                    Document.Remove(i);
+                }
+            }
+        }
+        Selected = Document.Add(Brush, cell, Rotation, asset, (Brush - 1) % 5);
+        Changed = Changed || Selected >= 0;
+    }
+
+    public void Render()
+    {
+        if (!Playing)
+        {
+            Vector3 direction = Camera.Forward();
+            ed_ray(&Ray[0], Camera.Position.X, Camera.Position.Y, Camera.Position.Z, direction.X, direction.Y,
+                   direction.Z, Camera.VerticalFov);
+        }
+        ed_view_begin();
+        Camera view = Camera;
+        if (Playing)
+        {
+            view = Game->View;
+        }
+        BeginWorld(&view);
+        ox_lights_reset(0.32f, 0.34f, 0.38f);
+        ox_light(0, -0.4f, -1.0f, -0.3f, 0xE0EEFFFFu, 0.7f, 1.0f);
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            if (Document.Data[at] == 7.0f)
+            {
+                ox_light(1, Document.Data[at + 1], Document.Data[at + 2], Document.Data[at + 3],
+                         Palette(cast<int>(Document.Data[at + 9])), Document.Data[at + 11], 12.0f);
+            }
+        }
+
+        ResetGeometryClip();
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            int kind = cast<int>(Document.Data[at]);
+            if (kind == 0 || (Playing && kind >= 7))
+            {
+                continue;
+            }
+            Primitive value = MakePrimitive(&Document.Data[0], i);
+
+            if (Playing)
+            {
+                Scene *scene = Game->Rooms[0].Value;
+                int slot = PlaySlots[i];
+                if (slot >= 0)
+                {
+                    value.Transform = scene->Objects[slot].Transform;
+                }
+            }
+
+            int asset = cast<int>(Document.Data[at + 8]);
+            int texture = 0;
+            if (kind == 1 && asset == 0)
+            {
+                texture = Checker;
+            }
+            if (ed_asset_kind(asset) == 1)
+            {
+                texture = ed_asset_handle(asset);
+            }
+            Vector3 p = value.Transform.Position;
+            Quaternion q = value.Transform.Rotation;
+            Vector3 size = value.Size;
+
+            if (kind == 6 && ed_asset_handle(asset) != 0)
+            {
+                int model = ed_asset_handle(asset);
+                Bounds bounds = ModelBounds(model);
+                Vector3 extent = Subtract(bounds.High, bounds.Low);
+                Vector3 scale = Vector3(size.X / Max(0.02f, extent.X), size.Y / Max(0.02f, extent.Y),
+                                        size.Z / Max(0.02f, extent.Z));
+                Vector3 center = Scale(Add(bounds.High, bounds.Low), 0.5f);
+                center = Vector3(center.X * scale.X, center.Y * scale.Y, center.Z * scale.Z);
+                Pose pose = value.Transform;
+                pose.Position = Subtract(p, Rotate(q, center));
+                DrawModelPose(model, pose, scale, 0xFFFFFFFFu);
+            }
+            else
+            {
+                uint color = value.Material.Color;
+                if (kind == 6)
+                {
+                    color = 0xFF55AAFFu;
+                }
+                ox_primitive(value.Shape, p.X, p.Y, p.Z, q.X, q.Y, q.Z, q.W, size.X, size.Y, size.Z, color,
+                             texture, 2.0f, value.Material.Emission);
+            }
+        }
+
+        if (!Playing)
+        {
+            if (Grid)
+            {
+                ed_grid(cast<float>(Layer) * 2.0f + 0.008f);
+            }
+            if (Selected >= 0)
+            {
+                int at = Selected * Stride;
+                ed_object_outline(&Document.Data[at]);
+                if (Brush == 0 && !Flying)
+                {
+                    ed_gizmo_draw(&Document.Data[at], GizmoMode);
+                }
+            }
+
+            Vector3 cell = Vector3(0.0f, 0.0f, 0.0f);
+            if (Brush > 0 && ed_mouse(0) != 0 && !Flying && CellPoint(&cell))
+            {
+                ed_outline(cell.X, cell.Y, cell.Z, 2.0f, 0.06f, 2.0f, 0x6BE0C0FFu);
+            }
+        }
+
+        EndWorld();
+        int playing = 0;
+        if (Playing)
+        {
+            playing = 1;
+        }
+        ed_view_end(playing);
+    }
+}

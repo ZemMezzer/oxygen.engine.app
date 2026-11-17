@@ -1,0 +1,64 @@
+namespace OxygenEditor;
+
+extern int ed_init();
+extern void ed_close();
+extern int ed_guard(int dirty);
+extern int ed_project(int create);
+extern int ed_save(float *data, int count);
+extern int ed_save_as(float *data, int count);
+extern int ed_load(float *data, int count, int automatic);
+extern void ed_new_scene();
+extern int ed_asset_id();
+extern int ed_asset_find(readonly byte *path);
+extern int ed_storage_test(float *data);
+extern int ed_asset_kind(int id);
+extern int ed_asset_handle(int id);
+extern void ed_status(readonly byte *text);
+extern int ed_hierarchy_selection();
+extern void ed_import(int directory);
+extern void ed_sound(int id, float volume);
+extern void ed_stop_sound();
+extern void ed_voice(int slot, int asset, float volume);
+extern int ed_mouse(int query);
+extern float ed_wheel();
+extern int ed_pressed(int key);
+extern int ed_control();
+
+bool Pressed(int key)
+{
+    return ed_pressed(key) != 0;
+}
+extern void ed_ray(float *ray, float x, float y, float z, float fx, float fy, float fz, float fov);
+extern int ed_pick(float *ray, float x, float y, float z, float sx, float sy, float sz, float yaw,
+                   float pitch, float roll, float *distance);
+extern void ed_view_begin();
+extern void ed_view_end(int playing);
+extern void ed_grid(float height);
+extern void ed_outline(float x, float y, float z, float sx, float sy, float sz, uint color);
+extern int ed_ui(float *state, float *records);
+
+extern int ed_gizmo_active();
+extern int ed_gizmo_finish(int cancel);
+extern int ed_gizmo_update(float *record, int mode, int snap, int cancel);
+extern void ed_gizmo_draw(float *record, int mode);
+extern void ed_object_outline(float *record);
+extern int ed_gizmo_tests();
+
+extern void ed_present();
+extern int ed_input_blocked();
+extern int ed_key_down(int key);
+extern float ed_look(int axis);
+extern void ed_capture(int enabled);
+extern int ed_transform_values(float *values);
+extern int ed_parent_source();
+extern int ed_parent_target();
+extern void ed_euler(float x, float y, float z, float w, float *result);
+
+bool EditorKeyDown(int key)
+{
+    return ed_key_down(key) != 0;
+}
+
+extern int ed_workspace_tests();
+
+extern int ed_validate_scene(float *records);

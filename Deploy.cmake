@@ -1,0 +1,7 @@
+set(directory "${ROOT}/../oxygen.engine.app/build/${PROFILE}/x86_64-pc-windows-msvc")
+if(NOT EXISTS "${directory}/Oxygen.Editor.exe")
+    message(FATAL_ERROR "Editor executable was not produced")
+endif()
+file(COPY "${RUNTIME}" DESTINATION "${directory}")
+file(COPY "${ROOT}/licenses" DESTINATION "${directory}")
+message(STATUS "Deployed ${directory}/Oxygen.Editor.exe")

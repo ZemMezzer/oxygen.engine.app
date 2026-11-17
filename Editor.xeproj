@@ -1,0 +1,23 @@
+[project]
+name = "Oxygen.Editor"
+type = "executable"
+version = "0.1.0"
+
+[source]
+root = "src"
+
+[references]
+projects = ["../oxygen.engine.lib/Oxygen.xeproj"]
+
+[libraries]
+library-paths = ["../oxygen.engine.lib/build/native/lib"]
+libraries = ["oxygen_platform"]
+
+[profile.debug]
+optimization = 0
+debug-info = true
+checks = true
+
+[profile.release]
+optimization = 2
+checks = true

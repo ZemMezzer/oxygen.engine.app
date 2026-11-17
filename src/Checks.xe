@@ -1,0 +1,167 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int EditorChecks(Editor *editor)
+{
+    int failures = ed_workspace_tests() + ed_gizmo_tests();
+    Document tilted = Document();
+    int slot = tilted.Add(2, Vector3(1.0f, 2.0f, 3.0f), 0.0f, 0, 0);
+    tilted.Data[slot * Stride + 13] = 90.0f;
+    Primitive value = MakePrimitive(&tilted.Data[0], slot);
+    Vector3 up = Rotate(value.Transform.Rotation, Vector3(0.0f, 1.0f, 0.0f));
+    if (Abs(up.X + 1.0f) > 0.001f || Abs(up.Y) > 0.001f || Abs(value.Transform.Position.Y - 3.0f) > 0.001f)
+    {
+        Log("FAIL: scene primitive rotation and gizmo pivot disagree.");
+        failures++;
+    }
+    Document tree = Document();
+    int parent = tree.Add(2, Vector3(0.0f, 0.0f, 0.0f), 0.0f, 0, 1);
+    int child = tree.Add(2, Vector3(4.0f, 0.0f, 0.0f), 0.0f, 0, 2);
+    int leaf = tree.Add(6, Vector3(6.0f, 0.0f, 0.0f), 0.0f, 0, 3);
+    if (!tree.Reparent(child, parent) || !tree.Reparent(leaf, child) || tree.Reparent(parent, leaf))
+    {
+        Log("FAIL: hierarchy parenting or cycle guard.");
+        failures++;
+    }
+    if (tree.Data[child * Stride + 1] != 4.0f)
+    {
+        failures++;
+    }
+    float[] original = new float[RecordSize];
+    for (int i = 0; i < RecordSize; i++)
+    {
+        original[i] = tree.Data[i];
+    }
+    tree.Data[parent * Stride + 1] = 2.0f;
+    tree.Data[parent * Stride + 4] = 90.0f;
+    tree.Data[parent * Stride + 5] = 4.0f;
+    tree.Data[parent * Stride + 6] = 4.0f;
+    tree.Data[parent * Stride + 7] = 4.0f;
+    tree.FollowTransform(&original[0], parent);
+    if (Abs(tree.Data[child * Stride + 1] - 2.0f) > 0.001f ||
+        Abs(tree.Data[child * Stride + 3] + 8.0f) > 0.001f ||
+        Abs(tree.Data[leaf * Stride + 3] + 12.0f) > 0.001f || tree.Data[child * Stride + 6] != 4.0f)
+    {
+        Log("FAIL: descendants do not inherit parent transforms.");
+        failures++;
+    }
+    tree.ResetHistory();
+    int duplicated = tree.Duplicate(parent);
+    tree.Commit();
+    if (duplicated < 0 || tree.Count() != 6 || tree.Parent(duplicated) != -1 ||
+        tree.Parent(duplicated + 1) != duplicated || tree.Parent(duplicated + 2) != duplicated + 1)
+    {
+        Log("FAIL: duplicate subtree remaps parents.");
+        failures++;
+    }
+    tree.Restore(tree.Cursor - 1);
+    if (tree.Count() != 3)
+    {
+        failures++;
+    }
+    tree.Restore(tree.Cursor + 1);
+    tree.Remove(duplicated);
+    tree.Commit();
+    if (tree.Count() != 3)
+    {
+        failures++;
+    }
+    tree.Restore(tree.Cursor - 1);
+    if (tree.Count() != 6)
+    {
+        failures++;
+    }
+    if (!tree.Reparent(child, -1) || tree.Parent(leaf) != child)
+    {
+        failures++;
+    }
+    delete (original);
+    if (failures == 0)
+    {
+        Log("PASS: parenting, cycle rejection, inherited transforms, subtree duplication/deletion and Undo.");
+    }
+
+    int before = editor->Document.Count();
+    Vector3 cell = Vector3(15.0f, 0.0f, 15.0f);
+    editor->Brush = 3;
+    editor->PaintCell(cell);
+    editor->FinishStroke();
+    editor->Brush = 1;
+    editor->PaintCell(cell);
+    editor->FinishStroke();
+
+    if (editor->Document.Count() != before + 2)
+    {
+        failures++;
+    }
+
+    editor->Brush = 3;
+    editor->Rotation = 90.0f;
+    editor->PaintCell(cell);
+    editor->FinishStroke();
+
+    if (editor->Document.Count() != before + 2 ||
+        editor->Document.Data[editor->Selected * Stride + 4] != 90.0f)
+    {
+        failures++;
+    }
+
+    editor->Document.Restore(editor->Document.Cursor - 1);
+    int wall = editor->Document.Cell(cell.X, cell.Y, cell.Z, 3);
+
+    if (wall < 0 || editor->Document.Data[wall * Stride + 4] != 0.0f)
+    {
+        failures++;
+    }
+
+    editor->Document.Restore(editor->Document.Cursor - 1);
+    editor->Document.Restore(editor->Document.Cursor - 1);
+
+    if (editor->Document.Count() != before)
+    {
+        failures++;
+    }
+
+    editor->Document.ResetHistory();
+    editor->Brush = 1;
+    editor->Rotation = 0.0f;
+    editor->Selected = -1;
+
+    // Exercise circular history capacity and a new edit after Undo.
+    Document history = Document();
+    history.ResetHistory();
+
+    for (int i = 0; i < 40; i++)
+    {
+        history.Data[1] = cast<float>(i);
+        history.Commit();
+    }
+
+    history.Restore(0);
+    if (history.Data[1] != 8.0f)
+    {
+        failures++;
+    }
+
+    history.Restore(10);
+    history.Data[1] = 100.0f;
+    history.Commit();
+    if (history.HistoryCount != 12 || history.Cursor != 11)
+    {
+        failures++;
+    }
+
+    history.Restore(10);
+    if (history.Data[1] != 18.0f)
+    {
+        failures++;
+    }
+
+    if (failures == 0)
+    {
+        Log("PASS: tile painting/replacement, independent floor layer, stroke Undo and circular history branching.");
+    }
+
+    return failures;
+}

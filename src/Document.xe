@@ -1,0 +1,501 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+const int Capacity = 4096;
+const int Stride = 15;
+const int RecordSize = Capacity * Stride;
+const int HistorySize = 32;
+
+// Authoring data has no native handles: kind, origin position, yaw, size, asset, palette, motion, strength,
+// pitch, roll.
+struct Document
+{
+    public float[] Data;
+    public float[] History;
+    public int HistoryStart;
+    public int HistoryCount;
+    public int Cursor;
+    public bool Dirty;
+
+    public Document()
+    {
+        Data = new float[RecordSize];
+        History = new float[RecordSize * HistorySize];
+    }
+
+    public ~Document()
+    {
+        delete (History);
+        delete (Data);
+    }
+
+    public void ResetHistory()
+    {
+        HistoryStart = 0;
+        HistoryCount = 1;
+        Cursor = 0;
+
+        for (int i = 0; i < RecordSize; i++)
+        {
+            History[i] = Data[i];
+        }
+    }
+
+    public void Commit()
+    {
+        HistoryCount = Cursor + 1;
+
+        if (HistoryCount == HistorySize)
+        {
+            HistoryStart = (HistoryStart + 1) % HistorySize;
+            HistoryCount--;
+        }
+
+        int start = ((HistoryStart + HistoryCount) % HistorySize) * RecordSize;
+
+        for (int i = 0; i < RecordSize; i++)
+        {
+            History[start + i] = Data[i];
+        }
+
+        HistoryCount++;
+        Cursor = HistoryCount - 1;
+        Dirty = true;
+    }
+
+    public void Restore(int cursor)
+    {
+        if (cursor < 0 || cursor >= HistoryCount)
+        {
+            return;
+        }
+
+        Cursor = cursor;
+        int start = ((HistoryStart + cursor) % HistorySize) * RecordSize;
+
+        for (int i = 0; i < RecordSize; i++)
+        {
+            Data[i] = History[start + i];
+        }
+
+        Dirty = true;
+    }
+
+    public int Count()
+    {
+        int count = 0;
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] != 0.0f)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    public int Cell(float x, float y, float z, int brush)
+    {
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            int kind = cast<int>(Data[at]);
+            if (brush == 1 && kind != 1)
+            {
+                continue;
+            }
+            if (brush >= 2 && brush <= 5 && (kind < 2 || kind > 5))
+            {
+                continue;
+            }
+            float origin = Data[at + 2];
+
+            if (Data[at] == 1.0f)
+            {
+                origin += 0.2f;
+            }
+
+            if (Data[at] > 0.0f && Abs(Data[at + 1] - x) < 0.01f && Abs(origin - y) < 0.01f &&
+                Abs(Data[at + 3] - z) < 0.01f)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    public int Add(int kind, Vector3 origin, float yaw, int asset, int palette)
+    {
+        int slot = -1;
+
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] == 0.0f)
+            {
+                slot = i;
+                break;
+            }
+        }
+
+        if (slot < 0)
+        {
+            ed_status("Scene limit reached: 4096 objects.");
+            return -1;
+        }
+
+        int at = slot * Stride;
+        Data[at] = cast<float>(kind);
+        Data[at + 1] = origin.X;
+        Data[at + 2] = origin.Y;
+        Data[at + 3] = origin.Z;
+        Data[at + 4] = yaw;
+        Data[at + 5] = 2.0f;
+        Data[at + 6] = 2.0f;
+        Data[at + 7] = 2.0f;
+        Data[at + 8] = cast<float>(asset);
+        Data[at + 9] = cast<float>(palette);
+        Data[at + 10] = 0.0f;
+        Data[at + 11] = 2.0f;
+        Data[at + 12] = 0.0f;
+        Data[at + 13] = 0.0f;
+        Data[at + 14] = 0.0f;
+
+        if (kind == 1)
+        {
+            Data[at + 2] -= 0.2f;
+            Data[at + 6] = 0.2f;
+        }
+
+        if (kind == 3)
+        {
+            Data[at + 7] = 0.2f;
+        }
+
+        if (kind == 5)
+        {
+            Data[at + 5] = 0.8f;
+            Data[at + 7] = 0.8f;
+        }
+
+        if (kind == 6)
+        {
+            int model = ed_asset_handle(asset);
+            Bounds bounds = ModelBounds(model);
+            Vector3 size = Subtract(bounds.High, bounds.Low);
+            float scale = 2.0f / Max(0.02f, Max(size.X, Max(size.Y, size.Z)));
+            Data[at + 5] = Max(0.02f, size.X * scale);
+            Data[at + 6] = Max(0.02f, size.Y * scale);
+            Data[at + 7] = Max(0.02f, size.Z * scale);
+        }
+
+        if (kind >= 7)
+        {
+            Data[at + 5] = 0.35f;
+            Data[at + 6] = 0.35f;
+            Data[at + 7] = 0.35f;
+            Data[at + 10] = 2.0f;
+            Data[at + 11] = 0.7f;
+
+            if (kind == 7)
+            {
+                Data[at + 2] += 2.8f;
+                Data[at + 11] = 2.0f;
+                Data[at + 12] = 0.0f;
+                Data[at + 13] = 0.0f;
+            }
+        }
+
+        return slot;
+    }
+
+    public int Parent(int slot)
+    {
+        return cast<int>(Data[slot * Stride + 14]) - 1;
+    }
+
+    public bool Descendant(int slot, int ancestor)
+    {
+        int current = slot;
+        for (int depth = 0; depth < Capacity && current >= 0; depth++)
+        {
+            if (current == ancestor)
+            {
+                return true;
+            }
+            current = Parent(current);
+        }
+        return false;
+    }
+
+    public bool Reparent(int slot, int parent)
+    {
+        if (slot < 0 || slot >= Capacity || Data[slot * Stride] == 0.0f || parent < -1 ||
+            parent >= Capacity || parent == slot ||
+            (parent >= 0 && (Data[parent * Stride] == 0.0f || Descendant(parent, slot))))
+        {
+            ed_status("Cannot parent an object to itself or to one of its children.");
+            return false;
+        }
+        int depth = 0;
+        int current = parent;
+        while (current >= 0)
+        {
+            depth++;
+            current = Parent(current);
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] == 0.0f || !Descendant(i, slot))
+            {
+                continue;
+            }
+            int childDepth = 0;
+            current = i;
+            while (current != slot)
+            {
+                childDepth++;
+                current = Parent(current);
+            }
+            if (depth + childDepth >= 64)
+            {
+                ed_status("Hierarchy depth limit reached.");
+                return false;
+            }
+        }
+        if (Parent(slot) == parent)
+        {
+            return false;
+        }
+        // World records keep the current placement when the hierarchy changes.
+        Data[slot * Stride + 14] = cast<float>(parent + 1);
+        return true;
+    }
+
+    public void Remove(int slot)
+    {
+        int[] affected = new int[Capacity];
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] != 0.0f && Descendant(i, slot))
+            {
+                affected[i] = 1;
+            }
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (affected[i] != 0)
+            {
+                Data[i * Stride] = 0.0f;
+                Data[i * Stride + 14] = 0.0f;
+            }
+        }
+        delete (affected);
+    }
+
+    public int Duplicate(int slot)
+    {
+        if (slot < 0 || Data[slot * Stride] == 0.0f)
+        {
+            return -1;
+        }
+        int[] copies = new int[Capacity];
+        int[] vacancies = new int[Capacity];
+        int needed = 0;
+        int available = 0;
+        for (int i = 0; i < Capacity; i++)
+        {
+            copies[i] = -1;
+            if (Data[i * Stride] == 0.0f)
+            {
+                vacancies[available++] = i;
+            }
+            else if (Descendant(i, slot))
+            {
+                needed++;
+            }
+        }
+        if (available < needed)
+        {
+            delete (copies);
+            delete (vacancies);
+            ed_status("Not enough vacancies object slots to duplicate this hierarchy.");
+            return -1;
+        }
+        int used = 0;
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] != 0.0f && Descendant(i, slot))
+            {
+                copies[i] = vacancies[used++];
+            }
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (copies[i] < 0)
+            {
+                continue;
+            }
+            int at = copies[i] * Stride;
+            for (int j = 0; j < Stride; j++)
+            {
+                Data[at + j] = Data[i * Stride + j];
+            }
+            int parent = Parent(i);
+            if (parent >= 0 && copies[parent] >= 0)
+            {
+                Data[at + 14] = cast<float>(copies[parent] + 1);
+            }
+        }
+        int result = copies[slot];
+        delete (copies);
+        delete (vacancies);
+        return result;
+    }
+
+    public void FollowTransform(float *before, int root)
+    {
+        if (root < 0)
+        {
+            return;
+        }
+        Primitive oldRoot = MakePrimitive(before, root);
+        Primitive newRoot = MakePrimitive(&Data[0], root);
+        Quaternion inverse = oldRoot.Transform.Rotation;
+        inverse.X = -inverse.X;
+        inverse.Y = -inverse.Y;
+        inverse.Z = -inverse.Z;
+        Quaternion turn = CombineRotation(newRoot.Transform.Rotation, inverse);
+        Vector3 ratio = Vector3(newRoot.Size.X / oldRoot.Size.X, newRoot.Size.Y / oldRoot.Size.Y,
+                                newRoot.Size.Z / oldRoot.Size.Z);
+        float[] angles = new float[3];
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (i == root || Data[i * Stride] == 0.0f || !Descendant(i, root))
+            {
+                continue;
+            }
+            int at = i * Stride;
+            Primitive old = MakePrimitive(before, i);
+            Vector3 relative = Rotate(inverse, Subtract(old.Transform.Position, oldRoot.Transform.Position));
+            relative = Vector3(relative.X * ratio.X, relative.Y * ratio.Y, relative.Z * ratio.Z);
+            Vector3 center = Rotate(newRoot.Transform.Rotation, relative);
+            center.X += newRoot.Transform.Position.X;
+            center.Y += newRoot.Transform.Position.Y;
+            center.Z += newRoot.Transform.Position.Z;
+            Quaternion rotation = CombineRotation(turn, old.Transform.Rotation);
+            ed_euler(rotation.X, rotation.Y, rotation.Z, rotation.W, &angles[0]);
+            Data[at + 5] = Clamp(old.Size.X * ratio.X, 0.02f, 1000.0f);
+            Data[at + 6] = Clamp(old.Size.Y * ratio.Y, 0.02f, 1000.0f);
+            Data[at + 7] = Clamp(old.Size.Z * ratio.Z, 0.02f, 1000.0f);
+            Data[at + 1] = center.X;
+            Data[at + 2] = center.Y - Data[at + 6] * 0.5f;
+            Data[at + 3] = center.Z;
+            Data[at + 12] = angles[0];
+            Data[at + 4] = angles[1];
+            Data[at + 13] = angles[2];
+        }
+        delete (angles);
+    }
+
+    public void Starter()
+    {
+        for (int i = 0; i < RecordSize; i++)
+        {
+            Data[i] = 0.0f;
+        }
+
+        for (int x = -4; x <= 3; x++)
+        {
+            for (int z = -4; z <= 3; z++)
+            {
+                Add(1, Vector3(cast<float>(x) * 2.0f + 1.0f, 0.0f, cast<float>(z) * 2.0f + 1.0f), 0.0f, 0, 0);
+            }
+        }
+
+        for (int i = -4; i <= 3; i++)
+        {
+            Add(3, Vector3(cast<float>(i) * 2.0f + 1.0f, 0.0f, -7.0f), 0.0f, 0, 1);
+            Add(3, Vector3(-7.0f, 0.0f, cast<float>(i) * 2.0f + 1.0f), 90.0f, 0, 1);
+        }
+
+        Add(4, Vector3(3.0f, 0.0f, -3.0f), 0.0f, 0, 2);
+        Add(2, Vector3(3.0f, 0.0f, -5.0f), 0.0f, 0, 2);
+        Add(5, Vector3(-3.0f, 0.0f, -3.0f), 0.0f, 0, 3);
+        Add(7, Vector3(-3.0f, 0.0f, 1.0f), 0.0f, 0, 4);
+        Add(9, Vector3(1.0f, 0.0f, 5.0f), 0.0f, 0, 3);
+        int model = ed_asset_find("Props/Crate.obj");
+
+        if (model != 0)
+        {
+            Add(6, Vector3(-3.0f, 0.0f, 3.0f), 20.0f, model, 2);
+        }
+
+        int sound = ed_asset_find("Sounds/Chime.wav");
+
+        if (sound != 0)
+        {
+            Add(8, Vector3(-3.0f, 0.0f, 5.0f), 0.0f, sound, 5);
+        }
+
+        ResetHistory();
+        Dirty = false;
+    }
+}
+
+uint Palette(int index)
+{
+    if (index == 1)
+    {
+        return 0x617F9CFFu;
+    }
+    if (index == 2)
+    {
+        return 0xCBB583FFu;
+    }
+    if (index == 3)
+    {
+        return 0x69BCA9FFu;
+    }
+    if (index == 4)
+    {
+        return 0xFFD39BFFu;
+    }
+    if (index == 5)
+    {
+        return 0xBF8FB8FFu;
+    }
+    return 0xAAB6C2FFu;
+}
+
+Primitive MakePrimitive(float *data, int slot)
+{
+    int at = slot * Stride;
+    int kind = cast<int>(data[at]);
+    int shape = ShapeBox;
+    if (kind == 4)
+    {
+        shape = ShapeRamp;
+    }
+    if (kind == 5)
+    {
+        shape = ShapeCylinder;
+    }
+    if (kind >= 7)
+    {
+        shape = ShapeSphere;
+    }
+    Vector3 size = Vector3(data[at + 5], data[at + 6], data[at + 7]);
+    Vector3 center = Vector3(data[at + 1], data[at + 2] + size.Y * 0.5f, data[at + 3]);
+    Primitive value = Primitive(shape, center, size, Surface(Palette(cast<int>(data[at + 9]))));
+    value.Transform.Rotation = RotationEuler(
+        Vector3(data[at + 12] * Pi / 180.0f, data[at + 4] * Pi / 180.0f, data[at + 13] * Pi / 180.0f));
+    if (kind >= 7)
+    {
+        value.Material.Emission = 0.7f;
+    }
+    return value;
+}

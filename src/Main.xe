@@ -1,0 +1,120 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int Main()
+{
+    if (!OpenWindow(1600, 1000, "Oxygen - Scene Editor"))
+    {
+        return 1;
+    }
+    if (ed_init() == 0)
+    {
+        CloseWindow();
+        return 1;
+    }
+    Editor *editor = new Editor();
+    int smoke = Option("OXYGEN_EDITOR_SMOKE");
+    int frames = 0;
+    int failures = 0;
+
+    if (smoke != 0)
+    {
+        failures += EditorChecks(editor);
+        int before = editor->Document.Count();
+        editor->Document.Add(2, Vector3(5.0f, 0.0f, 1.0f), 0.0f, 0, 2);
+        editor->Document.Commit();
+        editor->Document.Restore(editor->Document.Cursor - 1);
+        if (editor->Document.Count() != before)
+        {
+            failures++;
+        }
+        editor->Document.Restore(editor->Document.Cursor + 1);
+        if (editor->Document.Count() != before + 1)
+        {
+            failures++;
+        }
+        if (!editor->Save(false))
+        {
+            failures++;
+        }
+        if (ed_load(&editor->Document.Data[0], Capacity, 1) == 0)
+        {
+            failures++;
+        }
+        if (editor->Document.Count() != before + 1)
+        {
+            failures++;
+        }
+        failures += ed_storage_test(&editor->Document.Data[0]);
+    }
+
+    while (true)
+    {
+        if (ShouldClose() || editor->Quit)
+        {
+            if (editor->MayLeave())
+            {
+                break;
+            }
+            editor->Quit = false;
+        }
+        float dt = Min(FrameTime(), 0.05f);
+        if (smoke != 0)
+        {
+            dt = PhysicsStep;
+        }
+        BeginFrame(0x13171EFFu);
+        editor->FillUI();
+        int action = ed_ui(&editor->UI[0], &editor->Document.Data[0]);
+        editor->Action(action);
+        editor->Update(dt);
+        editor->Render();
+        ed_present();
+        frames++;
+
+        if (smoke != 0 && frames == 5)
+        {
+            Screenshot("oxygen-editor.png");
+        }
+        if (smoke != 0 && frames == 6)
+        {
+            editor->Play();
+            if (!editor->Playing)
+            {
+                failures++;
+            }
+        }
+        if (smoke != 0 && frames == 80)
+        {
+            Screenshot("oxygen-editor-play.png");
+        }
+        EndFrame();
+        if (smoke != 0 && frames >= 90)
+        {
+            break;
+        }
+    }
+
+    if (smoke != 0)
+    {
+        if (editor->Playing && !editor->Game->Grounded())
+        {
+            failures++;
+        }
+        editor->Stop();
+        if (failures == 0)
+        {
+            Log("PASS: editor history, scene save/load, play mode and grounded player.");
+        }
+        else
+        {
+            Log("FAIL: editor regression checks.");
+        }
+    }
+
+    delete (editor);
+    ed_close();
+    CloseWindow();
+    return failures;
+}
