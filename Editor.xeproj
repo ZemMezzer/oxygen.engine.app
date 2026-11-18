@@ -7,7 +7,7 @@ version = "0.1.0"
 root = "src"
 
 [references]
-projects = ["../oxygen.engine.lib/Oxygen.xeproj"]
+projects = ["../oxygen.engine.lib/Oxygen.xeproj", "../../Xenon/xenon.std/libxenon.xeproj"]
 
 [libraries]
 library-paths = ["../oxygen.engine.lib/build/native/lib"]
