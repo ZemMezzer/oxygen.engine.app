@@ -1,17 +1,47 @@
+bool resourcePanelFocused = false, tilePaletteFocused = false, layersPanelFocused = false;
 // Docking and platform input stay here; document commands and history belong to Xenon.
 namespace
 {
 GLFWwindow *mainWindow = nullptr, *sceneWindow = nullptr, *capturedWindow = nullptr;
-bool panelOpen[5] = {true, true, true, true, true};
-const char *panelNames[] = {"Scene", "Hierarchy", "Inspector", "Resources", "Tiles"};
+constexpr int panelCount = 6;
+bool panelOpen[panelCount] = {true, true, true, true, true, true};
+const char *panelNames[] = {"Scene", "Hierarchy", "Inspector", "Resources", "Tiles", "Layers"};
 bool sceneHovered = false, sceneVisible = false, resetDock = false, transformEditing = false;
-bool numericDirty = false;
-int hierarchySelection = -1, hierarchyParent = -1;
-bool revealSelection = false;
-bool revealPath[capacity]{};
-int numericSelection = -1, parentSource = -1, parentTarget = -1;
-float numeric[9]{}, pendingNumeric[9]{}, numericStart[9]{};
-std::deque<int> commands;
+using InspectorCallback = int (*)(int, float *, float *, float *);
+InspectorCallback inspectorCallback = nullptr;
+using HierarchyCallback = void (*)(float *, float *);
+HierarchyCallback hierarchyCallback = nullptr;
+int parentSource = -1, parentTarget = -1;
+
+using WorkspaceModelCallback = int (*)(int, int, float *, float *, char *);
+WorkspaceModelCallback workspaceModelCallback = nullptr;
+struct CommandQueueView
+{
+    void push_back(int action)
+    {
+        workspaceModelCallback(0, action, nullptr, nullptr, nullptr);
+    }
+    void push_front(int action)
+    {
+        workspaceModelCallback(1, action, nullptr, nullptr, nullptr);
+    }
+    bool empty() const
+    {
+        return workspaceModelCallback(2, 0, nullptr, nullptr, nullptr) == 0;
+    }
+    int front() const
+    {
+        return workspaceModelCallback(3, 0, nullptr, nullptr, nullptr);
+    }
+    void pop_front()
+    {
+        workspaceModelCallback(4, 0, nullptr, nullptr, nullptr);
+    }
+    void clear()
+    {
+        workspaceModelCallback(5, 0, nullptr, nullptr, nullptr);
+    }
+} commands;
 std::string iniPath;
 Vector2 lookDelta{};
 double lastMouseX = 0, lastMouseY = 0;
@@ -62,16 +92,18 @@ void defaultDock(ImGuiID dock)
     ImGui::DockBuilderRemoveNode(dock);
     ImGui::DockBuilderAddNode(dock, ImGuiDockNodeFlags_DockSpace);
     ImGui::DockBuilderSetNodeSize(dock, ImGui::GetMainViewport()->WorkSize);
-    ImGuiID center = dock, left, right, bottom, tiles;
+    ImGuiID center = dock, left, right, bottom, tiles, layers;
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Left, .18f, &left, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Right, .25f, &right, &center);
     ImGui::DockBuilderSplitNode(center, ImGuiDir_Down, .26f, &bottom, &center);
     ImGui::DockBuilderSplitNode(left, ImGuiDir_Down, .43f, &tiles, &left);
+    ImGui::DockBuilderSplitNode(right, ImGuiDir_Down, .36f, &layers, &right);
     ImGui::DockBuilderDockWindow("Scene", center);
     ImGui::DockBuilderDockWindow("Hierarchy", left);
     ImGui::DockBuilderDockWindow("Inspector", right);
     ImGui::DockBuilderDockWindow("Resources", bottom);
     ImGui::DockBuilderDockWindow("Tiles", tiles);
+    ImGui::DockBuilderDockWindow("Layers", layers);
     ImGui::DockBuilderFinish(dock);
     std::fill(std::begin(panelOpen), std::end(panelOpen), true);
 }
@@ -91,78 +123,28 @@ void ensureViewport()
     SetTextureFilter(viewport.texture, TEXTURE_FILTER_BILINEAR);
 }
 
-void hierarchyNode(int slot, const float *state, const float *records,
-                   const std::vector<std::vector<int>> &children, int depth)
+int pendingLayerSource = -1, pendingLayerTarget = -1;
+using LayersPanelCallback = void (*)(float *, float *);
+LayersPanelCallback layersPanelCallback = nullptr;
+
+bool recordTreeEditable(const float *records, int root)
 {
-    if (depth >= 64)
+    return workspaceModelCallback(6, root, const_cast<float *>(records), nullptr, nullptr) != 0;
+}
+
+void layersPanel(const float *state, const float *records)
+{
+    if (!panelOpen[5])
     {
         return;
     }
-    ImGui::PushID(slot);
-    int type = (int)records[slot * stride];
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (children[slot].empty())
+    ImGui::SetNextWindowSize({320, 330}, ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Layers", &panelOpen[5]))
     {
-        flags |= ImGuiTreeNodeFlags_Leaf;
+        layersPanelFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        layersPanelCallback(const_cast<float *>(state), const_cast<float *>(records));
     }
-    if ((int)state[3] == slot)
-    {
-        flags |= ImGuiTreeNodeFlags_Selected;
-    }
-    if (revealSelection && revealPath[slot])
-    {
-        ImGui::SetNextItemOpen(true);
-    }
-    bool open = ImGui::TreeNodeEx("object", flags, "%s  #%d", names[type], slot + 1);
-    if (revealSelection && (int)state[3] == slot && !ImGui::IsItemVisible())
-    {
-        ImGui::SetScrollHereY(.5f);
-    }
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-    {
-        selectedRow = slot;
-        request(70);
-    }
-    if (ImGui::BeginDragDropSource())
-    {
-        ImGui::SetDragDropPayload("OXYGEN_OBJECT", &slot, sizeof(slot));
-        ImGui::Text("%s #%d", names[type], slot + 1);
-        ImGui::EndDragDropSource();
-    }
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("OXYGEN_OBJECT"))
-        {
-            parentSource = *(const int *)payload->Data;
-            parentTarget = slot;
-            request(92);
-        }
-        ImGui::EndDragDropTarget();
-    }
-    if (ImGui::BeginPopupContextItem())
-    {
-        if (ImGui::MenuItem("Select"))
-        {
-            selectedRow = slot;
-            request(70);
-        }
-        if (ImGui::MenuItem("Detach from parent", nullptr, false, records[slot * stride + 14] != 0))
-        {
-            parentSource = slot;
-            parentTarget = -1;
-            request(92);
-        }
-        ImGui::EndPopup();
-    }
-    if (open)
-    {
-        for (int child : children[slot])
-        {
-            hierarchyNode(child, state, records, children, depth + 1);
-        }
-        ImGui::TreePop();
-    }
-    ImGui::PopID();
+    ImGui::End();
 }
 
 void hierarchyPanel(const float *state, const float *records)
@@ -173,203 +155,28 @@ void hierarchyPanel(const float *state, const float *records)
     }
     if (ImGui::Begin("Hierarchy", &panelOpen[1]))
     {
-        ImGui::BeginDisabled(state[6] != 0);
-        ImGui::TextDisabled("%d objects", (int)state[4]);
-        ImGui::Selectable("Scene root (drop to detach)", false);
-        if (ImGui::BeginDragDropTarget())
-        {
-            if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("OXYGEN_OBJECT"))
-            {
-                parentSource = *(const int *)payload->Data;
-                parentTarget = -1;
-                request(92);
-            }
-            ImGui::EndDragDropTarget();
-        }
-        ImGui::Separator();
-        int currentSelection = (int)state[3];
-        int currentParent = currentSelection >= 0 ? (int)records[currentSelection * stride + 14] : -1;
-        revealSelection = hierarchySelection != currentSelection || hierarchyParent != currentParent;
-        hierarchySelection = currentSelection;
-        hierarchyParent = currentParent;
-        std::fill(std::begin(revealPath), std::end(revealPath), false);
-        int ancestor = hierarchySelection;
-        for (int depth = 0; depth < 64 && ancestor >= 0; depth++)
-        {
-            ancestor = (int)records[ancestor * stride + 14] - 1;
-            if (ancestor >= 0)
-            {
-                revealPath[ancestor] = true;
-            }
-        }
-        std::vector<std::vector<int>> children(capacity);
-        std::vector<int> roots;
-        for (int i = 0; i < capacity; i++)
-        {
-            if (!records[i * stride])
-            {
-                continue;
-            }
-            int parent = (int)records[i * stride + 14] - 1;
-            if (parent >= 0 && parent < capacity)
-            {
-                children[parent].push_back(i);
-            }
-            else
-            {
-                roots.push_back(i);
-            }
-        }
-        for (int slot : roots)
-        {
-            hierarchyNode(slot, state, records, children, 0);
-        }
-        ImGui::EndDisabled();
+        hierarchyCallback(const_cast<float *>(state), const_cast<float *>(records));
     }
     ImGui::End();
 }
 
 void inspectorPanel(const float *state, const float *records)
 {
-    bool wasEditing = transformEditing;
-    transformEditing = false;
     if (!panelOpen[2])
     {
+        inspectorCallback(3, nullptr, nullptr, nullptr);
+        transformEditing = false;
         return;
     }
     if (ImGui::Begin("Inspector", &panelOpen[2]))
     {
-        int selected = (int)state[3];
-        if (selected >= 0)
-        {
-            const float *r = records + selected * stride;
-            ImGui::Text("%s  #%d", names[(int)r[0]], selected + 1);
-            ImGui::SeparatorText("Transform / world");
-            if (selected != numericSelection || !wasEditing)
-            {
-                numericSelection = selected;
-                for (int a = 0; a < 3; a++)
-                {
-                    numeric[a] = r[1 + a];
-                    numeric[6 + a] = r[5 + a];
-                }
-                numeric[3] = r[12];
-                numeric[4] = r[4];
-                numeric[5] = r[13];
-                numericDirty = false;
-            }
-            ImGui::BeginDisabled(state[6] != 0);
-            const char *groups[] = {"Position", "Rotation (degrees)", "Size (metres)"};
-            const char *axes[] = {"X", "Y", "Z"};
-            bool commit = false;
-            for (int g = 0; g < 3; g++)
-            {
-                ImGui::TextUnformatted(groups[g]);
-                if (ImGui::BeginTable(groups[g], 3, ImGuiTableFlags_SizingStretchSame))
-                {
-                    for (int a = 0; a < 3; a++)
-                    {
-                        ImGui::TableNextColumn();
-                        ImGui::TextDisabled("%s", axes[a]);
-                    }
-                    for (int a = 0; a < 3; a++)
-                    {
-                        ImGui::TableNextColumn();
-                        ImGui::PushID(g * 3 + a);
-                        ImGui::SetNextItemWidth(-1);
-                        ImGui::InputFloat("##value", &numeric[g * 3 + a], 0, 0, "%.3f");
-                        if (ImGui::IsItemActivated())
-                        {
-                            std::copy(numeric, numeric + 9, numericStart);
-                        }
-                        if (ImGui::IsItemEdited())
-                        {
-                            numericDirty = true;
-                        }
-                        bool active = ImGui::IsItemActive();
-                        transformEditing |= active;
-                        if (active && ImGui::IsKeyPressed(ImGuiKey_Escape))
-                        {
-                            std::copy(numericStart, numericStart + 9, numeric);
-                            numericDirty = false;
-                        }
-                        if (numericDirty && (ImGui::IsItemDeactivatedAfterEdit() ||
-                                             (active && ImGui::IsKeyPressed(ImGuiKey_Enter))))
-                        {
-                            commit = true;
-                        }
-                        ImGui::PopID();
-                    }
-                    ImGui::EndTable();
-                }
-            }
-            if (commit)
-            {
-                std::copy(numeric, numeric + 9, pendingNumeric);
-                commands.push_front(90);
-                numericDirty = false;
-            }
-            ImGui::TextDisabled("Enter / leave field: apply. Esc: cancel.");
-            ImGui::SeparatorText("Hierarchy");
-            int parent = (int)r[14] - 1;
-            if (parent < 0)
-            {
-                ImGui::TextDisabled("Parent: Scene root");
-            }
-            else
-            {
-                ImGui::Text("Parent: %s #%d", names[(int)records[parent * stride]], parent + 1);
-                if (ImGui::Button("Detach from parent"))
-                {
-                    parentSource = selected;
-                    parentTarget = -1;
-                    request(92);
-                }
-            }
-            ImGui::SeparatorText("Object");
-            const char *modes[] = {"Static collider", "Dynamic body", "No collision"};
-            if (ImGui::Button(modes[(int)r[10]], {-1, 0}))
-            {
-                request(60);
-            }
-            ImGui::BeginDisabled(ed_asset_kind(selectedAsset) != 1);
-            if (ImGui::Button("Apply selected texture", {-1, 0}))
-            {
-                request(63);
-            }
-            ImGui::EndDisabled();
-            if (r[0] == 7 || r[0] == 8)
-            {
-                ImGui::Text("Strength / volume: %.2f", r[11]);
-                if (ImGui::Button("-"))
-                {
-                    request(61);
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("+"))
-                {
-                    request(62);
-                }
-            }
-            if (ImGui::Button("Duplicate  Ctrl+D", {-1, 0}))
-            {
-                request(91);
-            }
-            if (ImGui::Button("Focus  F"))
-            {
-                request(64);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Delete"))
-            {
-                request(50);
-            }
-            ImGui::EndDisabled();
-        }
-        else
-        {
-            ImGui::TextWrapped("Select an object in Scene or Hierarchy to edit its properties.");
-        }
+        transformEditing =
+            inspectorCallback(0, const_cast<float *>(state), const_cast<float *>(records), nullptr) != 0;
+    }
+    else
+    {
+        inspectorCallback(3, nullptr, nullptr, nullptr);
+        transformEditing = false;
     }
     ImGui::End();
 }
@@ -382,44 +189,8 @@ void tilesPanel(const float *state)
     }
     if (ImGui::Begin("Tiles", &panelOpen[4]))
     {
-        ImGui::BeginDisabled(state[6] != 0);
-        ImGui::TextDisabled("Built-in tile set / 2 metre grid");
-        for (int i = 1; i <= 10; i++)
-        {
-            bool active = (int)state[0] == i;
-            if (active)
-            {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.16f, .42f, .38f, 1));
-            }
-            if (ImGui::Button(i == 10 ? "Erase" : names[i], {-1, 28}))
-            {
-                request(20 + i);
-            }
-            if (active)
-            {
-                ImGui::PopStyleColor();
-            }
-        }
-        ImGui::Separator();
-        ImGui::Text("Layer %d  /  Y = %.0f m", (int)state[1], state[1] * 2);
-        if (ImGui::Button("Layer -"))
-        {
-            request(40);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Layer +"))
-        {
-            request(41);
-        }
-        if (ImGui::Button(TextFormat("Rotate brush: %.0f", state[2]), {-1, 0}))
-        {
-            request(42);
-        }
-        if (ImGui::Button("Select objects  [V]", {-1, 0}))
-        {
-            request(20);
-        }
-        ImGui::EndDisabled();
+        tilePaletteFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        tilePalette(state);
     }
     ImGui::End();
 }
@@ -432,17 +203,18 @@ void refreshAssets()
         {
             ox_release_texture(a.handle);
         }
-        if (a.handle && a.kind == 2)
+        if (a.handle && (a.kind == 2 || a.kind == 5))
         {
             ox_release_model(a.handle);
         }
         a.handle = 0;
         a.failed = false;
     }
-    scan();
-    message("Resources refreshed.");
+    tileCatalogDirty = true;
 }
 
+using ResourcesCallback = void (*)(float *);
+ResourcesCallback resourcesCallback = nullptr;
 void resourcesPanel(const float *state)
 {
     if (!panelOpen[3])
@@ -451,124 +223,41 @@ void resourcesPanel(const float *state)
     }
     if (ImGui::Begin("Resources", &panelOpen[3]))
     {
-        ImGui::BeginDisabled(state[6] != 0);
-        if (ImGui::Button("Import file"))
-        {
-            request(9);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Import folder"))
-        {
-            request(10);
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Refresh"))
-        {
-            refreshAssets();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Up") && !folder.empty())
-        {
-            folder = folder.parent_path();
-        }
-        ImGui::TextDisabled("Assets / %s", utf8(folder).c_str());
-        ImGui::Separator();
-        ImGui::BeginChild("Files", {std::max(120.f, ImGui::GetContentRegionAvail().x - 235), 0},
-                          ImGuiChildFlags_Borders);
-        std::vector<fs::path> folders;
-        for (auto &a : assets)
-        {
-            fs::path rel = a.relative.lexically_relative(folder.empty() ? fs::path(".") : folder);
-            if (rel.empty() || *rel.begin() == ".." || !rel.has_parent_path())
-            {
-                continue;
-            }
-            fs::path child = folder / *rel.begin();
-            if (std::find(folders.begin(), folders.end(), child) == folders.end())
-            {
-                folders.push_back(child);
-            }
-        }
-        int columns = std::max(1, (int)(ImGui::GetContentRegionAvail().x / 130));
-        if (ImGui::BeginTable("Cards", columns))
-        {
-            for (const auto &f : folders)
-            {
-                ImGui::TableNextColumn();
-                if (ImGui::Button(("[Folder]\n" + utf8(f.filename())).c_str(), {-1, 68}))
-                {
-                    folder = f;
-                    break;
-                }
-            }
-            for (auto &a : assets)
-            {
-                if (a.relative.parent_path() != folder)
-                {
-                    continue;
-                }
-                ImGui::TableNextColumn();
-                ImGui::PushID(a.id);
-                const char *types[] = {"", "Texture", "Model", "Audio", "File"};
-                bool selected = a.id == selectedAsset;
-                if (selected)
-                {
-                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.16f, .42f, .38f, 1));
-                }
-                if (ImGui::Button(types[a.kind], {-1, 43}))
-                {
-                    selectedAsset = a.id;
-                    request(71);
-                }
-                if (selected)
-                {
-                    ImGui::PopStyleColor();
-                }
-                ImGui::TextWrapped("%s", utf8(a.relative.filename()).c_str());
-                ImGui::PopID();
-            }
-            ImGui::EndTable();
-        }
-        ImGui::EndChild();
-        ImGui::SameLine();
-        ImGui::BeginChild("Preview", {0, 0});
-        Asset *selected = asset(selectedAsset);
-        if (selected)
-        {
-            ImGui::TextWrapped("%s", utf8(selected->relative).c_str());
-            if (selected->kind == 1)
-            {
-                Texture2D texture = ox_lookup_texture(handle(selected));
-                if (texture.id)
-                {
-                    float scale = std::min(210.f / texture.width, 130.f / texture.height);
-                    ImGui::Image((ImTextureID)texture.id, {texture.width * scale, texture.height * scale});
-                }
-            }
-            if (selected->kind == 2 && handle(selected))
-            {
-                // Render the model in the shared context; all detached panels can display this texture.
-                renderModelPreview(selectedAsset);
-                if (preview.id)
-                {
-                    ImGui::Image((ImTextureID)preview.texture.id, {216, 100}, {0, 1}, {1, 0});
-                }
-            }
-            if (selected->kind == 3 && ImGui::Button("Preview audio"))
-            {
-                request(12);
-            }
-        }
-        else
-        {
-            ImGui::TextWrapped("Import resources or drop files into the main editor window.");
-        }
-        ImGui::EndChild();
-        ImGui::EndDisabled();
+        resourcePanelFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        resourcesCallback(const_cast<float *>(state));
     }
     ImGui::End();
 }
 
+using WorkspaceControllerCallback = int (*)(int, int, float *, const char *);
+WorkspaceControllerCallback workspaceControllerCallback = nullptr;
+void focusSceneForNavigation(bool hovered)
+{
+    float input[]{
+        hovered ? 1.f : 0.f,
+        ImGui::IsMouseClicked(ImGuiMouseButton_Right) ? 1.f : 0.f,
+        ImGui::IsAnyItemActive() ? 1.f : 0.f,
+        ImGui::GetIO().WantTextInput ? 1.f : 0.f,
+        transformEditing ? 1.f : 0.f,
+        ImGui::IsDragDropActive() ? 1.f : 0.f,
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ? 1.f : 0.f};
+    if (!workspaceControllerCallback(4, 0, input, nullptr))
+    {
+        return;
+    }
+    ImGui::SetWindowFocus();
+    // These panels were submitted before Scene and cached their old focus this frame.
+    resourcePanelFocused = tilePaletteFocused = layersPanelFocused = tileFocused = false;
+    if (sceneWindow && !glfwGetWindowAttrib(sceneWindow, GLFW_FOCUSED))
+    {
+        glfwFocusWindow(sceneWindow);
+    }
+}
+
+using SceneToolbarCallback = void (*)(float *);
+SceneToolbarCallback sceneToolbarCallback = nullptr;
+using LayoutCallback = void (*)(int, int *);
+LayoutCallback layoutCallback = nullptr;
 void scenePanel(const float *state)
 {
     sceneHovered = sceneVisible = false;
@@ -585,36 +274,7 @@ void scenePanel(const float *state)
         {
             sceneWindow = mainWindow;
         }
-        ImGui::BeginDisabled(state[6] != 0);
-        const char *tools[] = {"Move [W]", "Rotate [E]", "Scale [R]"};
-        for (int i = 0; i < 3; i++)
-        {
-            if (i)
-            {
-                ImGui::SameLine();
-            }
-            bool active = state[0] == 0 && state[20] == i + 1;
-            if (active)
-            {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(.16f, .42f, .38f, 1));
-            }
-            if (ImGui::Button(tools[i]))
-            {
-                request(80 + i);
-            }
-            if (active)
-            {
-                ImGui::PopStyleColor();
-            }
-        }
-        ImGui::EndDisabled();
-        ImGui::SameLine();
-        if (ImGui::Button(state[6] ? "Stop [Esc]" : "Play [F5]"))
-        {
-            request(6);
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("%d FPS", GetFPS());
+        sceneToolbarCallback(const_cast<float *>(state));
         ImVec2 origin = ImGui::GetCursorScreenPos();
         ImVec2 main = ImGui::GetMainViewport()->Pos;
         ImVec2 available = ImGui::GetContentRegionAvail();
@@ -622,6 +282,10 @@ void scenePanel(const float *state)
         ensureViewport();
         ImGui::Image((ImTextureID)viewport.texture.id, {view.width, view.height}, {0, 1}, {1, 0});
         sceneHovered = ImGui::IsItemHovered();
+        if (!state[6])
+        {
+            focusSceneForNavigation(sceneHovered);
+        }
         ImDrawList *draw = ImGui::GetWindowDrawList();
         draw->AddText({origin.x + 12, origin.y + 10}, IM_COL32(175, 191, 210, 255),
                       state[6] ? "PLAY / Esc to return" : "PERSPECTIVE / 2 metre grid");
@@ -649,25 +313,15 @@ EDITOR_API void ed_workspace_init()
     io.ConfigWindowsMoveFromTitleBarOnly = true;
     iniPath = utf8(fs::path(GetApplicationDirectory()) / "oxygen-editor-layout.ini");
     io.IniFilename = smoke() ? nullptr : iniPath.c_str();
-    if (!smoke())
+    int visibility[panelCount];
+    for (int i = 0; i < panelCount; i++)
     {
-        std::ifstream f(iniPath + ".panels");
-        std::string magic;
-        int version = 0;
-        f >> magic >> version;
-        bool values[5]{};
-        bool valid = magic == "OXYGEN_PANELS" && version == 1;
-        for (int i = 0; i < 5; i++)
-        {
-            int value = -1;
-            f >> value;
-            valid &= value == 0 || value == 1;
-            values[i] = value == 1;
-        }
-        if (f && valid)
-        {
-            std::copy(values, values + 5, panelOpen);
-        }
+        visibility[i] = panelOpen[i] ? 1 : 0;
+    }
+    layoutCallback(0, visibility);
+    for (int i = 0; i < panelCount; i++)
+    {
+        panelOpen[i] = visibility[i] != 0;
     }
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();
@@ -691,18 +345,24 @@ EDITOR_API void ed_workspace_init()
 
 EDITOR_API void ed_workspace_close()
 {
-    if (!smoke())
+    int visibility[panelCount];
+    for (int i = 0; i < panelCount; i++)
     {
-        std::ofstream f(iniPath + ".panels");
-        f << "OXYGEN_PANELS 1\n";
-        for (bool open : panelOpen)
-        {
-            f << (open ? 1 : 0) << ' ';
-        }
+        visibility[i] = panelOpen[i] ? 1 : 0;
     }
+    layoutCallback(1, visibility);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
+}
+
+EDITOR_API int ed_layer_delete_source()
+{
+    return pendingLayerSource;
+}
+EDITOR_API int ed_layer_delete_target()
+{
+    return pendingLayerTarget;
 }
 
 EDITOR_API Vector2 ed_pointer()
@@ -712,7 +372,13 @@ EDITOR_API Vector2 ed_pointer()
 }
 EDITOR_API int ed_input_blocked()
 {
-    return ImGui::GetIO().WantTextInput || transformEditing;
+    float input[]{ImGui::GetIO().WantTextInput ? 1.f : 0.f,
+                  transformEditing ? 1.f : 0.f,
+                  tileFocused ? 1.f : 0.f,
+                  resourcePanelFocused ? 1.f : 0.f,
+                  tilePaletteFocused ? 1.f : 0.f,
+                  layersPanelFocused ? 1.f : 0.f};
+    return workspaceControllerCallback(5, 0, input, nullptr);
 }
 EDITOR_API int ed_mouse(int query)
 {
@@ -740,7 +406,16 @@ EDITOR_API int ed_mouse(int query)
 }
 EDITOR_API float ed_wheel()
 {
-    return sceneHovered ? ImGui::GetIO().MouseWheel : 0;
+    float input[]{
+        sceneVisible ? 1.f : 0.f,
+        sceneHovered ? 1.f : 0.f,
+        capturedWindow ? 1.f : 0.f,
+        ImGui::GetIO().WantTextInput ? 1.f : 0.f,
+        transformEditing ? 1.f : 0.f,
+        ImGui::IsAnyItemActive() ? 1.f : 0.f,
+        ImGui::IsDragDropActive() ? 1.f : 0.f,
+        ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) ? 1.f : 0.f};
+    return workspaceControllerCallback(6, 0, input, nullptr) ? ImGui::GetIO().MouseWheel : 0;
 }
 EDITOR_API int ed_pressed(int key)
 {
@@ -785,19 +460,7 @@ EDITOR_API float ed_look(int axis)
 }
 EDITOR_API int ed_transform_values(float *values)
 {
-    for (int i = 0; i < 9; i++)
-    {
-        float v = pendingNumeric[i];
-        if (!std::isfinite(v) || (i < 3 && std::fabs(v) > 10000) ||
-            (i >= 3 && i < 6 && std::fabs(v) > 36000) || (i >= 6 && (v < .02f || v > 1000)))
-        {
-            message("Invalid transform: position +/-10000, rotation +/-36000, size 0.02..1000.");
-            numericSelection = -1;
-            return 0;
-        }
-    }
-    std::copy(pendingNumeric, pendingNumeric + 9, values);
-    return 1;
+    return inspectorCallback(1, nullptr, nullptr, values);
 }
 EDITOR_API int ed_parent_source()
 {
@@ -828,6 +491,7 @@ EDITOR_API int ed_ui(const float *state, const float *records)
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplGlfw_NewFrame();
     ImGui::NewFrame();
+    resourcePanelFocused = tilePaletteFocused = layersPanelFocused = false;
     lookDelta = {};
     if (capturedWindow)
     {
@@ -841,26 +505,7 @@ EDITOR_API int ed_ui(const float *state, const float *records)
         lastMouseX = x;
         lastMouseY = y;
     }
-    int native = ed_native_command();
-    if (native >= 200 && native < 205)
-    {
-        panelOpen[native - 200] = true;
-        ImGui::SetWindowFocus(panelNames[native - 200]);
-    }
-    else if (native == 210)
-    {
-        resetDock = true;
-    }
-    else if (native)
-    {
-        if (numericDirty)
-        {
-            std::copy(numeric, numeric + 9, pendingNumeric);
-            request(90);
-            numericDirty = false;
-        }
-        request(native);
-    }
+    workspaceControllerCallback(0, ed_native_command(), const_cast<float *>(state), nullptr);
     ed_native_menu_state(state[6] != 0, state[3] >= 0, state[18] != 0, state[19] != 0);
 
     ImGuiViewport *main = ImGui::GetMainViewport();
@@ -894,6 +539,7 @@ EDITOR_API int ed_ui(const float *state, const float *records)
     inspectorPanel(state, records);
     tilesPanel(state);
     resourcesPanel(state);
+    layersPanel(state, records);
     scenePanel(state);
     if (!sceneVisible)
     {
@@ -901,37 +547,21 @@ EDITOR_API int ed_ui(const float *state, const float *records)
         {
             ed_capture(0);
         }
-        if (state[6])
-        {
-            request(6);
-        }
         view = {0, 0, 1, 1};
         ensureViewport();
     }
     ed_gizmo_frame();
-    std::string title = "Oxygen - " + utf8(root.filename()) + " / " +
-                        (currentScene.empty() ? "Untitled" : utf8(currentScene.filename())) +
-                        (state[5] ? " *" : "");
-    SetWindowTitle(title.c_str());
+    workspaceControllerCallback(1, sceneVisible ? 1 : 0, const_cast<float *>(state), nullptr);
     if (IsFileDropped())
     {
         FilePathList dropped = LoadDroppedFiles();
-        if (!state[6])
+        for (unsigned i = 0; i < dropped.count; i++)
         {
-            for (unsigned i = 0; i < dropped.count; i++)
-            {
-                importPath(fromUtf8(dropped.paths[i]));
-            }
+            workspaceControllerCallback(2, 0, const_cast<float *>(state), dropped.paths[i]);
         }
         UnloadDroppedFiles(dropped);
     }
-    if (commands.empty())
-    {
-        return 0;
-    }
-    int action = commands.front();
-    commands.pop_front();
-    return action;
+    return workspaceControllerCallback(3, 0, nullptr, nullptr);
 }
 
 EDITOR_API void ed_present()
@@ -943,6 +573,234 @@ EDITOR_API void ed_present()
     ImGui::UpdatePlatformWindows();
     ImGui::RenderPlatformWindowsDefault();
     glfwMakeContextCurrent(previous);
+}
+
+int sceneNavigationFocusTests()
+{
+    ImGuiIO &io = ImGui::GetIO();
+    const bool oldResources = resourcePanelFocused, oldTiles = tilePaletteFocused,
+               oldTileEditor = tileFocused;
+    const bool oldLayers = layersPanelFocused;
+    const bool oldHovered = sceneHovered, oldVisible = sceneVisible, oldEditing = transformEditing;
+    int failures = 0;
+    auto draw = [&]() {
+        ImGuiViewport *main = ImGui::GetMainViewport();
+        ImGui::SetNextWindowViewport(main->ID);
+        ImGui::SetNextWindowPos({main->Pos.x + 400, main->Pos.y + 20}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize({300, 220}, ImGuiCond_Always);
+        ImGui::Begin("Palette input regression", nullptr, ImGuiWindowFlags_NoSavedSettings);
+        ImGui::TextUnformatted("Tile palette");
+        ImGui::End();
+        ImGui::SetNextWindowViewport(main->ID);
+        ImGui::SetNextWindowPos({main->Pos.x + 20, main->Pos.y + 20}, ImGuiCond_Always);
+        ImGui::SetNextWindowSize({300, 220}, ImGuiCond_Always);
+        ImGui::Begin("Scene input regression", nullptr, ImGuiWindowFlags_NoSavedSettings);
+        ImGui::Dummy({250, 150});
+        sceneVisible = true;
+        sceneHovered = ImGui::IsItemHovered();
+        focusSceneForNavigation(sceneHovered);
+        bool focused = ImGui::IsWindowFocused();
+        ImGui::End();
+        return focused;
+    };
+    auto begin = [&](bool right, float x, bool text) {
+        ImVec2 origin = ImGui::GetMainViewport()->Pos;
+        io.AddMousePosEvent(origin.x + x, origin.y + 80);
+        io.AddMouseButtonEvent(ImGuiMouseButton_Right, right);
+        ImGui::NewFrame();
+        resourcePanelFocused = tilePaletteFocused = layersPanelFocused = tileFocused = true;
+        transformEditing = false;
+        io.WantTextInput = text;
+    };
+    begin(false, 80, false);
+    draw();
+    ImGui::SetWindowFocus("Palette input regression");
+    ImGui::EndFrame();
+
+    begin(true, 80, false);
+    if (!draw() || ed_input_blocked() || !ed_mouse(4) || ed_mouse(1))
+    {
+        failures++;
+        puts("FAIL: right click must focus Scene and unblock navigation without a paint click.");
+        printf("focus diagnostics: hovered=%d right=%d clicked=%d active=%d blocked=%d text=%d\n",
+               sceneHovered, ed_mouse(4), ImGui::IsMouseClicked(1), ImGui::IsAnyItemActive(),
+               ed_input_blocked(), io.WantTextInput);
+    }
+    ImGui::EndFrame();
+
+    begin(false, 80, false);
+    ImGui::SetWindowFocus("Palette input regression");
+    if (draw() || !ed_input_blocked())
+    {
+        failures++;
+        puts("FAIL: hovering Scene must not steal keyboard focus.");
+    }
+    ImGui::EndFrame();
+
+    io.AddMouseWheelEvent(0, 1);
+    begin(false, 80, false);
+    ImGui::SetWindowFocus("Palette input regression");
+    if (draw() || !ed_input_blocked() || ed_wheel() != 1)
+    {
+        failures++;
+        puts("FAIL: wheel over Scene must zoom without taking keyboard focus.");
+    }
+    io.WantTextInput = true;
+    if (ed_wheel() != 0)
+    {
+        failures++;
+    }
+    io.WantTextInput = false;
+    ImGui::EndFrame();
+
+    begin(true, 500, false);
+    if (draw() || !ed_input_blocked())
+    {
+        failures++;
+        puts("FAIL: right click outside the viewport must not focus Scene.");
+    }
+    ImGui::EndFrame();
+    begin(false, 80, false);
+    draw();
+    ImGui::EndFrame();
+    begin(true, 80, true);
+    if (draw() || !ed_input_blocked())
+    {
+        failures++;
+        puts("FAIL: active text input must keep its input protection.");
+    }
+    ImGui::EndFrame();
+    begin(false, 80, false);
+    draw();
+    ImGui::EndFrame();
+    resourcePanelFocused = oldResources;
+    tilePaletteFocused = oldTiles;
+    layersPanelFocused = oldLayers;
+    tileFocused = oldTileEditor;
+    sceneHovered = oldHovered;
+    sceneVisible = oldVisible;
+    transformEditing = oldEditing;
+    if (!failures)
+    {
+        puts(
+            "PASS: Scene navigation claims right-click focus from palette/resources without painting; hover/text protected.");
+    }
+    return failures;
+}
+
+int layerKeyboardTests()
+{
+    auto *previous = ImGui::GetCurrentContext();
+    auto *context = ImGui::CreateContext();
+    ImGui::SetCurrentContext(context);
+    auto savedCommands = commands;
+    auto savedLayers = worldLayers;
+    auto savedFlags = layerFlags;
+    layerFlags.clear();
+    bool savedOpen = panelOpen[5], savedFocus = layersPanelFocused;
+    replaceLayers({"Layer 1", "Layer 2"});
+    panelOpen[5] = true;
+    ImGuiIO &io = ImGui::GetIO();
+    io.DisplaySize = {1200, 900};
+    io.DeltaTime = 1.f / 60;
+    io.IniFilename = nullptr;
+    io.ConfigInputTrickleEventQueue = false;
+    unsigned char *pixels;
+    int width, height;
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+    float state[32]{};
+    state[18] = state[19] = 1;
+    std::vector<float> records(capacity * stride, 0);
+    auto frame = [&](ImGuiKey key, bool control = false, bool text = false, bool focused = true) {
+        commands.clear();
+        for (auto candidate : {ImGuiKey_Delete, ImGuiKey_Z, ImGuiKey_Y, ImGuiKey_Escape, ImGuiKey_F2})
+        {
+            io.AddKeyEvent(candidate, candidate == key);
+        }
+        io.AddKeyEvent(ImGuiMod_Ctrl, control);
+        ImGui::NewFrame();
+        if (focused)
+        {
+            ImGui::SetNextWindowFocus();
+        }
+        else
+        {
+            ImGui::FocusWindow(nullptr);
+        }
+        io.WantTextInput = text;
+        layersPanel(state, records.data());
+        ImGui::Render();
+        return commands.empty() ? 0 : commands.front();
+    };
+    int failures = 0;
+    frame(ImGuiKey_None);
+    if (frame(ImGuiKey_Z, true) != 7)
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    if (frame(ImGuiKey_Y, true) != 8)
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    if (frame(ImGuiKey_Z, true, true) != 0)
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    if (frame(ImGuiKey_Z, true, false, false) != 0)
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    frame(ImGuiKey_Delete);
+    if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    frame(ImGuiKey_Escape);
+    frame(ImGuiKey_None);
+    replaceLayers({"Layer 1"});
+    frame(ImGuiKey_Delete);
+    if (ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    frame(ImGuiKey_F2);
+    if (!ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    frame(ImGuiKey_Escape);
+    frame(ImGuiKey_None);
+    frame(ImGuiKey_F2, false, true);
+    if (ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        failures++;
+    }
+    frame(ImGuiKey_None);
+    ed_layer_add("Layer 2");
+    ed_layer_set_flags(0, 2);
+    frame(ImGuiKey_Delete);
+    if (ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+    {
+        failures++;
+    }
+    ImGui::DestroyContext(context);
+    ImGui::SetCurrentContext(previous);
+    commands = savedCommands;
+    replaceLayers(savedLayers, savedFlags);
+    panelOpen[5] = savedOpen;
+    layersPanelFocused = savedFocus;
+    puts(
+        failures
+            ? "FAIL: Layers keyboard shortcuts."
+            : "PASS: Layers F2 rename, Delete, Ctrl+Z/Y, focus/text protection, locked and last-layer guards.");
+    return failures;
 }
 
 EDITOR_API int ed_workspace_tests()
@@ -982,5 +840,109 @@ EDITOR_API int ed_workspace_tests()
     {
         puts("PASS: fast mouse gestures preserve a held drag frame before release.");
     }
-    return failures;
+    return failures + sceneNavigationFocusTests() + layerKeyboardTests();
+}
+
+EDITOR_API void ed_bind_workspace_model(WorkspaceModelCallback callback)
+{
+    workspaceModelCallback = callback;
+}
+
+EDITOR_API void ed_bind_layers_panel(LayersPanelCallback callback)
+{
+    layersPanelCallback = callback;
+}
+EDITOR_API void ed_layer_delete_view(int source, int target)
+{
+    pendingLayerSource = source;
+    pendingLayerTarget = target;
+}
+#include "editor_imgui.inl"
+
+EDITOR_API void ed_bind_inspector(InspectorCallback callback)
+{
+    inspectorCallback = callback;
+}
+EDITOR_API void ed_parent_view(int source, int target)
+{
+    parentSource = source;
+    parentTarget = target;
+}
+
+EDITOR_API void ed_bind_hierarchy(HierarchyCallback callback)
+{
+    hierarchyCallback = callback;
+}
+EDITOR_API void ed_row_view(int selected)
+{
+    selectedRow = selected;
+}
+
+EDITOR_API void ed_bind_resources(ResourcesCallback callback)
+{
+    resourcesCallback = callback;
+}
+EDITOR_API void ed_assets_refresh_view()
+{
+    refreshAssets();
+}
+EDITOR_API void ed_asset_selected_view(int id)
+{
+    selectedAsset = id;
+}
+EDITOR_API void ed_asset_preview(int id)
+{
+    Asset *selected = asset(id);
+    if (!selected)
+    {
+        return;
+    }
+    if (selected->kind == 1)
+    {
+        Texture2D texture = ox_lookup_texture(handle(selected));
+        if (texture.id)
+        {
+            float scale = std::min(210.f / texture.width, 130.f / texture.height);
+            ImGui::Image((ImTextureID)texture.id, {texture.width * scale, texture.height * scale});
+        }
+    }
+    if (selected->kind == 2 && handle(selected))
+    {
+        renderModelPreview(id);
+        if (preview.id)
+        {
+            ImGui::Image((ImTextureID)preview.texture.id, {216, 100}, {0, 1}, {1, 0});
+        }
+    }
+}
+
+EDITOR_API void ed_bind_scene_toolbar(SceneToolbarCallback callback)
+{
+    sceneToolbarCallback = callback;
+}
+EDITOR_API void ed_bind_layout(LayoutCallback callback)
+{
+    layoutCallback = callback;
+}
+
+EDITOR_API void ed_bind_workspace_controller(WorkspaceControllerCallback callback)
+{
+    workspaceControllerCallback = callback;
+}
+EDITOR_API void ed_panel_open(int index)
+{
+    if (index < 0 || index >= panelCount)
+    {
+        return;
+    }
+    panelOpen[index] = true;
+    ImGui::SetWindowFocus(panelNames[index]);
+}
+EDITOR_API void ed_layout_reset()
+{
+    resetDock = true;
+}
+EDITOR_API void ed_window_title(const char *title)
+{
+    SetWindowTitle(title);
 }

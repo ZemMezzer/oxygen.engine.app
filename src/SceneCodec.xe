@@ -1,0 +1,307 @@
+using Oxygen;
+using Xenon.Text;
+using Xenon.Collections;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+extern readonly byte *ed_asset_path(int id);
+extern int ed_register_asset(readonly byte *relative);
+extern void ed_bind_scene(function int(int, readonly byte *, float *, int) * callback);
+
+bool ValidSceneRecord(float *r)
+{
+    for (int i = 0; i < Stride; i++)
+    {
+        if (r[i] != r[i] || Abs(r[i]) > 3.402823466e38f)
+        {
+            return false;
+        }
+    }
+    if (r[0] < 1.0f || r[0] > 9.0f)
+    {
+        return false;
+    }
+    return r[0] == cast<float>(cast<int>(r[0])) && Abs(r[4]) <= 36000.0f && r[5] >= 0.02f &&
+           r[5] <= 1000.0f && r[6] >= 0.02f && r[6] <= 1000.0f && r[7] >= 0.02f && r[7] <= 1000.0f &&
+           r[8] >= 0.0f && r[8] <= 512.0f && r[8] == cast<float>(cast<int>(r[8])) && r[9] >= 0.0f &&
+           r[9] <= 5.0f && r[10] >= 0.0f && r[10] <= 2.0f && r[11] >= 0.0f && r[11] <= 32.0f &&
+           Abs(r[12]) <= 36000.0f && Abs(r[13]) <= 36000.0f && r[14] >= 0.0f &&
+           r[14] <= cast<float>(Capacity) && r[14] == cast<float>(cast<int>(r[14])) && r[15] >= 0.0f &&
+           r[15] < 4096.0f && r[15] == cast<float>(cast<int>(r[15]));
+}
+
+bool ValidSceneHierarchy(float *records)
+{
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (records[i * Stride] == 0.0f)
+        {
+            continue;
+        }
+        int current = i;
+        for (int depth = 0; depth < 65; depth++)
+        {
+            if (depth >= 64)
+            {
+                return false;
+            }
+            current = cast<int>(records[current * Stride + 14]) - 1;
+            if (current < 0)
+            {
+                break;
+            }
+            if (current >= Capacity || current == i || records[current * Stride] == 0.0f)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+int ed_validate_scene(float *records)
+{
+    for (int i = 0; i < Capacity; i++)
+    {
+        float *r = records + i * Stride;
+        if (r[0] != 0.0f && (!ValidSceneRecord(r) || r[15] >= cast<float>(ed_layer_count())))
+        {
+            return 0;
+        }
+    }
+    if (ValidSceneHierarchy(records))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+bool SaveSceneFile(readonly String &path, float *records, int count)
+{
+    if (count != Capacity || ed_validate_scene(records) == 0)
+    {
+        return false;
+    }
+    int used = 0;
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (records[i * Stride] != 0.0f)
+        {
+            used++;
+        }
+    }
+    StringBuilder output = StringBuilder();
+    output.Append("OXYGEN_TILE_SCENE 6\n");
+    output.Append(used);
+    output.Append("\n");
+    output.Append(ed_layer_count());
+    output.Append("\n");
+    for (int i = 0; i < ed_layer_count(); i++)
+    {
+        WorldLayer *layer = LayerService.Layers->Get(i);
+        Quoted(&output, layer->Name);
+        output.Append(" ");
+        output.Append(layer->Flags);
+        output.Append("\n");
+    }
+    for (int i = 0; i < Capacity; i++)
+    {
+        float *r = records + i * Stride;
+        if (r[0] == 0.0f)
+        {
+            continue;
+        }
+        output.Append(i);
+        output.Append(" ");
+        for (int j = 0; j < Stride; j++)
+        {
+            float value = r[j];
+            if (j == 8)
+            {
+                value = 0.0f;
+            }
+            output.Append(value);
+            output.Append(" ");
+        }
+        String reference = String(ed_asset_path(cast<int>(r[8])));
+        Quoted(&output, reference);
+        output.Append("\n");
+    }
+    return SaveTextAtomic(path, output.ToString());
+}
+
+bool LoadSceneFile(readonly String &path, float *destination, int count)
+{
+    if (count != Capacity)
+    {
+        return false;
+    }
+    TextReader reader = TextReader(File.ReadAllText(path));
+    if (!reader.Token().Equals(String("OXYGEN_TILE_SCENE")))
+    {
+        return false;
+    }
+    int version = reader.Integer();
+    int used = reader.Integer();
+    if (version < 1 || version > 6 || used < 0 || used > Capacity)
+    {
+        return false;
+    }
+    Vector<WorldLayer> layers = Vector<WorldLayer>();
+    if (version < 4)
+    {
+        layers.Add(WorldLayer(String("Layer 1"), 0));
+    }
+    else if (version == 4)
+    {
+        layers.Add(WorldLayer(String("World"), 0));
+        layers.Add(WorldLayer(String("Decorations"), 0));
+        for (int i = 3; i <= 8; i++)
+        {
+            StringBuilder name = StringBuilder();
+            name.Append("Layer ");
+            name.Append(i);
+            layers.Add(WorldLayer(name.ToString(), 0));
+        }
+    }
+    else
+    {
+        int layerCount = reader.Integer();
+        if (layerCount < 1 || layerCount > 4096)
+        {
+            return false;
+        }
+        for (int i = 0; i < layerCount; i++)
+        {
+            String name = reader.Token();
+            if (name.ByteLength == 0 || name.ByteLength > 120 || !CleanLayerName(name.CString).Equals(name))
+            {
+                return false;
+            }
+            for (int j = 0; j < name.ByteLength; j++)
+            {
+                if (name.CString[j] < cast<byte>(32) || name.CString[j] == cast<byte>(127))
+                {
+                    return false;
+                }
+            }
+            if (ContainsLayerName(&layers, name))
+            {
+                return false;
+            }
+            int flags = 0;
+            if (version >= 6)
+            {
+                flags = reader.Integer();
+            }
+            if (flags < 0 || flags > 3)
+            {
+                return false;
+            }
+            layers.Add(WorldLayer(name, flags));
+        }
+    }
+    unique<float[]> records = new float[RecordSize];
+    unique<String[]> references = new String[Capacity];
+    for (int i = 0; i < used; i++)
+    {
+        int slot = i;
+        if (version >= 3)
+        {
+            slot = reader.Integer();
+        }
+        if (slot < 0 || slot >= Capacity || records[slot * Stride] != 0.0f)
+        {
+            return false;
+        }
+        int fields = Stride;
+        if (version == 1)
+        {
+            fields = 12;
+        }
+        if (version == 2)
+        {
+            fields = 14;
+        }
+        if (version == 3)
+        {
+            fields = 15;
+        }
+        for (int j = 0; j < fields; j++)
+        {
+            records[slot * Stride + j] = cast<float>(reader.Number());
+        }
+        references[slot] = reader.Token();
+        if (!ValidSceneRecord(&records[slot * Stride]) ||
+            records[slot * Stride + 15] >= cast<float>(layers.Count) ||
+            (references[slot].ByteLength > 0 && !SafeAssetPath(references[slot])))
+        {
+            return false;
+        }
+    }
+    if (!reader.End() || !ValidSceneHierarchy(&records[0]))
+    {
+        return false;
+    }
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (references[i].ByteLength > 0)
+        {
+            int asset = ed_register_asset(references[i].CString);
+            if (asset == 0)
+            {
+                return false;
+            }
+            records[i * Stride + 8] = cast<float>(asset);
+            if (records[i * Stride] == 6.0f && ed_asset_kind(asset) == 5)
+            {
+                records[i * Stride + 10] = 0.0f;
+            }
+        }
+    }
+    *LayerService.Layers = move layers;
+    PublishLayers();
+    for (int i = 0; i < RecordSize; i++)
+    {
+        destination[i] = records[i];
+    }
+    return true;
+}
+
+int SceneDispatch(int operation, readonly byte *path, float *records, int count)
+{
+    try
+    {
+        bool result = false;
+        if (operation == 0)
+        {
+            result = SaveSceneFile(String(path), records, count);
+        }
+        if (operation == 1)
+        {
+            result = LoadSceneFile(String(path), records, count);
+        }
+        if (operation == 2)
+        {
+            result = ValidSceneRecord(records);
+        }
+        if (operation == 3)
+        {
+            result = ValidSceneHierarchy(records);
+        }
+        if (operation == 4)
+        {
+            return ed_validate_scene(records);
+        }
+        if (result)
+        {
+            return 1;
+        }
+    }
+    catch (...)
+    {
+        return 0;
+    }
+    return 0;
+}

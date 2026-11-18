@@ -13,16 +13,22 @@ struct Editor
     public int Brush;
     public int GizmoMode;
     public int Layer;
+    public int WorldLayer;
+    public bool SoloLayer;
+    public int StrokePlane;
+    public float StrokeDepth;
     public float Rotation;
     public int Selected;
     public int Texture;
+    public int TileAsset;
     public int Checker;
     public bool Stroke;
     public bool Changed;
     public bool Playing;
     public bool Grid;
     public bool Flying;
-    public int LastCell;
+    public Vector3 LastCell;
+    public bool HasLastCell;
     public bool Quit;
     public float[] TransformBefore;
     public int TransformRoot;
@@ -39,11 +45,12 @@ struct Editor
         TransformRoot = -1;
         Ray = new float[6];
         PlaySlots = new int[Capacity];
-        Brush = 1;
+        Brush = 0;
         GizmoMode = 1;
         Selected = -1;
         Grid = true;
-        LastCell = -1;
+        HasLastCell = false;
+        StrokePlane = -1;
         Checker = CheckerTexture(128, 2, 0xCFD9E0FFu, 0x929FAAFFu);
         Document.Starter();
 
@@ -77,7 +84,8 @@ struct Editor
 
         Changed = false;
         Stroke = false;
-        LastCell = -1;
+        HasLastCell = false;
+        StrokePlane = -1;
     }
 
     public void RememberTransform()
@@ -91,14 +99,16 @@ struct Editor
 
     public void FollowTransform()
     {
+        SnapWorldTile(&Document.Data[0], TransformRoot);
         Document.FollowTransform(&TransformBefore[0], TransformRoot);
-        if (ed_validate_scene(&Document.Data[0]) == 0)
+        if (!ConstrainTileChanges(&Document.Data[0], &TransformBefore[0]) ||
+            ed_validate_scene(&Document.Data[0]) == 0)
         {
             for (int i = 0; i < RecordSize; i++)
             {
                 Document.Data[i] = TransformBefore[i];
             }
-            ed_status("Transform cancelled: the hierarchy would exceed scene limits.");
+            ed_status("Transform cancelled: occupied tile cells or invalid transform.");
         }
     }
 
@@ -176,6 +186,11 @@ struct Editor
         {
             UI[i] = 0.0f;
         }
+        UI[24] = cast<float>(WorldLayer);
+        if (SoloLayer)
+        {
+            UI[25] = 1.0f;
+        }
         UI[20] = cast<float>(GizmoMode);
         UI[0] = cast<float>(Brush);
         UI[1] = cast<float>(Layer);
@@ -212,6 +227,13 @@ struct Editor
             }
             UI[15] = Document.Data[at + 10];
             UI[16] = Document.Data[at + 11];
+            if (IsWorldTile(&Document.Data[0], Selected))
+            {
+                Bounds cells = TileCells(MakePrimitive(&Document.Data[0], Selected));
+                UI[26] = (cells.High.X - cells.Low.X) * 2.0f;
+                UI[27] = (cells.High.Y - cells.Low.Y) * 2.0f;
+                UI[28] = (cells.High.Z - cells.Low.Z) * 2.0f;
+            }
         }
     }
 
@@ -273,6 +295,10 @@ struct Editor
             Primitive value = MakePrimitive(&Document.Data[0], i);
             value.Tag = i + 1;
             int motion = cast<int>(Document.Data[at + 10]);
+            if (IsWorldTile(&Document.Data[0], i))
+            {
+                motion = 0;
+            }
             value.Physics.Motion = BodyStatic;
             if (motion == 1)
             {
@@ -295,14 +321,32 @@ struct Editor
                 value.Material.TextureSlot = textureSlot++;
             }
 
-            // Imported models use an explicit bounding-box collision approximation in this iteration.
+            // Models use their authored triangles, centered exactly like the rendered instance.
+            BodySettings modelPhysics = value.Physics;
             if (kind == 6)
             {
                 value.Material.Color = 0xFFFFFFFFu;
+                value.Physics.Motion = BodyNone;
             }
             int slot = scene->FreeSlot();
             if (scene->Add(value) != 0)
             {
+                if (kind == 6 && modelPhysics.Motion != BodyNone)
+                {
+                    RigidBody body =
+                        CreateModelBody(scene->Physics, scene->Objects[slot].Id, ed_asset_handle(asset),
+                                        value.Size, value.Transform, modelPhysics);
+                    if (body.Handle == 0)
+                    {
+                        delete (scene);
+                        Stop();
+                        ed_status(
+                            "Cannot build mesh collider. Check the model geometry or set Physics to None.");
+                        return;
+                    }
+                    scene->Objects[slot].Body = body;
+                    scene->Objects[slot].Physics = modelPhysics;
+                }
                 PlaySlots[i] = slot;
             }
         }
@@ -350,7 +394,7 @@ struct Editor
             {
                 Stop();
             }
-            else
+            else if (ed_tile_suspend() != 0)
             {
                 Play();
             }
@@ -362,6 +406,77 @@ struct Editor
             return;
         }
 
+        if (action >= 1000 && action < 1000 + ed_layer_count())
+        {
+            WorldLayer = action - 1000;
+            Document.ActiveLayer = WorldLayer;
+            Selected = -1;
+            return;
+        }
+        if (action == 112)
+        {
+            if (Selected >= 0 && !Document.CanEdit(Selected))
+            {
+                Selected = -1;
+            }
+            Document.Commit();
+            return;
+        }
+        if ((action == 90 || action == 91 || (action >= 50 && action <= 63) ||
+             (action >= 6000 && action < 6000 + ed_layer_count())) &&
+            !Document.CanEditTree(Selected))
+        {
+            ed_status("Show and unlock the object's layer and child layers before editing.");
+            return;
+        }
+        if (action == 109)
+        {
+            WorldLayer = ed_layer_count() - 1;
+            Document.ActiveLayer = WorldLayer;
+            Selected = -1;
+            Document.Commit();
+            return;
+        }
+        if (action == 111)
+        {
+            if (Document.RemoveLayer(ed_layer_delete_source(), ed_layer_delete_target()))
+            {
+                WorldLayer = Document.ActiveLayer;
+                Selected = -1;
+                Document.Commit();
+            }
+            return;
+        }
+        if (action == 108)
+        {
+            SoloLayer = !SoloLayer;
+            return;
+        }
+        if (action >= 6000 && action < 6000 + ed_layer_count() && Selected >= 0)
+        {
+            if (ed_layer_editable(action - 6000) == 0)
+            {
+                ed_status("Show and unlock the destination layer first.");
+                return;
+            }
+            RememberTransform();
+            Document.Data[Selected * Stride + 15] = cast<float>(action - 6000);
+            if (ConstrainTileChanges(&Document.Data[0], &TransformBefore[0]))
+            {
+                WorldLayer = action - 6000;
+                Document.ActiveLayer = WorldLayer;
+                Document.Commit();
+            }
+            else
+            {
+                for (int i = 0; i < RecordSize; i++)
+                {
+                    Document.Data[i] = TransformBefore[i];
+                }
+                ed_status("The destination layer already contains a tile here.");
+            }
+            return;
+        }
         if (action == 91)
         {
             int copy = Document.Duplicate(Selected);
@@ -429,6 +544,10 @@ struct Editor
             if (ed_project(create) != 0)
             {
                 Texture = 0;
+                TileAsset = 0;
+                WorldLayer = 0;
+                Document.ActiveLayer = 0;
+                SoloLayer = false;
                 Selected = -1;
                 Document.Starter();
                 ed_load(&Document.Data[0], Capacity, 1);
@@ -452,6 +571,9 @@ struct Editor
                 Selected = -1;
                 Document.ResetHistory();
                 Document.Dirty = false;
+                WorldLayer = 0;
+                Document.ActiveLayer = 0;
+                SoloLayer = false;
             }
         }
 
@@ -462,6 +584,9 @@ struct Editor
                 Document.Data[i] = 0.0f;
             }
             Selected = -1;
+            WorldLayer = 0;
+            Document.ActiveLayer = 0;
+            SoloLayer = false;
             ed_new_scene();
             Document.ResetHistory();
             Document.Dirty = true;
@@ -470,11 +595,13 @@ struct Editor
         if (action == 7)
         {
             Document.Restore(Document.Cursor - 1);
+            WorldLayer = Document.ActiveLayer;
             Selected = -1;
         }
         if (action == 8)
         {
             Document.Restore(Document.Cursor + 1);
+            WorldLayer = Document.ActiveLayer;
             Selected = -1;
         }
         if (action == 9)
@@ -495,11 +622,11 @@ struct Editor
         }
         if (action == 40)
         {
-            Layer = cast<int>(Max(0.0f, cast<float>(Layer - 1)));
+            Layer--;
         }
         if (action == 41)
         {
-            Layer = cast<int>(Min(15.0f, cast<float>(Layer + 1)));
+            Layer++;
         }
         if (action == 42)
         {
@@ -512,18 +639,28 @@ struct Editor
         if (action == 70)
         {
             Selected = ed_hierarchy_selection();
+            if (Selected >= 0)
+            {
+                WorldLayer = cast<int>(Document.Data[Selected * Stride + 15]);
+                Document.ActiveLayer = WorldLayer;
+            }
             Brush = 0;
         }
 
         if (action == 71)
         {
+            TileAsset = 0;
             int kind = ed_asset_kind(ed_asset_id());
+            if (kind == 5)
+            {
+                TileAsset = ed_asset_id();
+            }
             if (kind == 1)
             {
                 Texture = ed_asset_id();
                 Brush = 1;
             }
-            if (kind == 2)
+            if (kind == 2 || kind == 5)
             {
                 Brush = 6;
             }
@@ -549,10 +686,15 @@ struct Editor
         if (action >= 51 && action <= 56)
         {
             int axis = (action - 51) / 2;
-            float step = -0.25f;
+            float amount = 0.25f;
+            if (IsWorldTile(&Document.Data[0], Selected))
+            {
+                amount = 2.0f;
+            }
+            float step = -amount;
             if (action % 2 == 0)
             {
-                step = 0.25f;
+                step = amount;
             }
             Document.Data[at + 1 + axis] += step;
         }
@@ -574,6 +716,11 @@ struct Editor
             }
         }
 
+        if (action == 60 && IsWorldTile(&Document.Data[0], Selected))
+        {
+            ed_status("Tiles are static world geometry.");
+            return;
+        }
         if (action == 60)
         {
             Document.Data[at + 10] = cast<float>((cast<int>(Document.Data[at + 10]) + 1) % 3);
@@ -630,7 +777,7 @@ struct Editor
         for (int i = 0; i < Capacity; i++)
         {
             int at = i * Stride;
-            if (Document.Data[at] == 0.0f)
+            if (!Document.CanEdit(i) || cast<int>(Document.Data[at + 15]) != WorldLayer)
             {
                 continue;
             }
@@ -650,8 +797,150 @@ struct Editor
         return selected;
     }
 
+    public bool TileBrush()
+    {
+        return Brush == 6 && ed_asset_kind(TileAsset) == 5;
+    }
+
+    public bool TileCellPoint(Vector3 *result)
+    {
+        int axis = 1;
+        float depth = cast<float>(Layer) * 2.0f;
+        if (Stroke && StrokePlane >= 0)
+        {
+            axis = StrokePlane;
+            depth = StrokeDepth;
+        }
+        else
+        {
+            float[] hit = new float[7];
+            float[] best = new float[7];
+            float nearest = 10000.0f;
+            Bounds occupied = Bounds(Vector3(0.0f, 0.0f, 0.0f), Vector3(0.0f, 0.0f, 0.0f));
+            for (int i = 0; i < Capacity; i++)
+            {
+                if (!IsWorldTile(&Document.Data[0], i) ||
+                    cast<int>(Document.Data[i * Stride + 15]) != WorldLayer)
+                {
+                    continue;
+                }
+                Bounds cells = TileCells(MakePrimitive(&Document.Data[0], i));
+                Bounds bounds = Bounds(Scale(cells.Low, 2.0f), Scale(cells.High, 2.0f));
+                if (ed_grid_ray(&Ray[0], cast<float *>(cast<void *>(&bounds)), &hit[0]) != 0 &&
+                    hit[6] < nearest)
+                {
+                    nearest = hit[6];
+                    occupied = cells;
+                    for (int j = 0; j < 7; j++)
+                    {
+                        best[j] = hit[j];
+                    }
+                }
+            }
+            if (nearest < 200.0f)
+            {
+                float offset = 0.01f;
+                if (Brush == 10)
+                {
+                    offset = -offset;
+                }
+                result->X = GridFloor((best[0] + best[3] * offset) * 0.5f) * 2.0f + 1.0f;
+                result->Y = GridFloor((best[1] + best[4] * offset) * 0.5f) * 2.0f;
+                result->Z = GridFloor((best[2] + best[5] * offset) * 0.5f) * 2.0f + 1.0f;
+                if (Abs(best[3]) > 0.5f)
+                {
+                    axis = 0;
+                }
+                if (Abs(best[5]) > 0.5f)
+                {
+                    axis = 2;
+                }
+                if (TileBrush())
+                {
+                    Bounds candidate = TileCells(TilePlacement(TileAsset, *result, Rotation));
+                    if (best[3] > 0.5f)
+                    {
+                        result->X += (occupied.High.X - candidate.Low.X) * 2.0f;
+                    }
+                    if (best[3] < -0.5f)
+                    {
+                        result->X += (occupied.Low.X - candidate.High.X) * 2.0f;
+                    }
+                    if (best[4] > 0.5f)
+                    {
+                        result->Y += (occupied.High.Y - candidate.Low.Y) * 2.0f;
+                    }
+                    if (best[4] < -0.5f)
+                    {
+                        result->Y += (occupied.Low.Y - candidate.High.Y) * 2.0f;
+                    }
+                    if (best[5] > 0.5f)
+                    {
+                        result->Z += (occupied.High.Z - candidate.Low.Z) * 2.0f;
+                    }
+                    if (best[5] < -0.5f)
+                    {
+                        result->Z += (occupied.Low.Z - candidate.High.Z) * 2.0f;
+                    }
+                }
+                delete (hit);
+                delete (best);
+                if (Stroke)
+                {
+                    StrokePlane = axis;
+                    StrokeDepth = result->Y;
+                    if (axis == 0)
+                    {
+                        StrokeDepth = result->X;
+                    }
+                    if (axis == 2)
+                    {
+                        StrokeDepth = result->Z;
+                    }
+                }
+                return true;
+            }
+            delete (hit);
+            delete (best);
+        }
+        if (Abs(Ray[3 + axis]) < 0.0001f)
+        {
+            return false;
+        }
+        float t = (depth - Ray[axis]) / Ray[3 + axis];
+        if (t < 0.0f || t > 200.0f)
+        {
+            return false;
+        }
+        result->X = GridFloor((Ray[0] + Ray[3] * t) * 0.5f) * 2.0f + 1.0f;
+        result->Y = GridFloor((Ray[1] + Ray[4] * t + 0.001f) * 0.5f) * 2.0f;
+        result->Z = GridFloor((Ray[2] + Ray[5] * t) * 0.5f) * 2.0f + 1.0f;
+        if (axis == 0)
+        {
+            result->X = depth;
+        }
+        if (axis == 1)
+        {
+            result->Y = depth;
+        }
+        if (axis == 2)
+        {
+            result->Z = depth;
+        }
+        if (Stroke)
+        {
+            StrokePlane = axis;
+            StrokeDepth = depth;
+        }
+        return true;
+    }
+
     public bool CellPoint(Vector3 *result)
     {
+        if (TileBrush() || Brush == 10)
+        {
+            return TileCellPoint(result);
+        }
         if (Abs(Ray[4]) < 0.0001f)
         {
             return false;
@@ -663,14 +952,9 @@ struct Editor
         }
         float x = Ray[0] + Ray[3] * t;
         float z = Ray[2] + Ray[5] * t;
-        if (x < -32.0f || x >= 32.0f || z < -32.0f || z >= 32.0f)
-        {
-            return false;
-        }
-        // Add a positive origin before integer conversion so negative cells floor correctly.
-        result->X = cast<float>(cast<int>((x + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+        result->X = GridFloor(x * 0.5f) * 2.0f + 1.0f;
         result->Y = cast<float>(Layer) * 2.0f;
-        result->Z = cast<float>(cast<int>((z + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+        result->Z = GridFloor(z * 0.5f) * 2.0f + 1.0f;
         return true;
     }
 
@@ -759,6 +1043,8 @@ struct Editor
             return;
         }
 
+        // Wheel navigation follows the hovered viewport without stealing keyboard focus.
+        Camera.Position = Add(Camera.Position, Scale(Camera.Forward(), ed_wheel() * 1.5f));
         if (ed_input_blocked() != 0)
         {
             return;
@@ -881,7 +1167,6 @@ struct Editor
             return;
         }
 
-        Camera.Position = Add(Camera.Position, Scale(Camera.Forward(), ed_wheel() * 1.5f));
         Vector3 forward = Camera.Forward();
         ed_ray(&Ray[0], Camera.Position.X, Camera.Position.Y, Camera.Position.Z, forward.X, forward.Y,
                forward.Z, Camera.VerticalFov);
@@ -889,7 +1174,7 @@ struct Editor
         {
             FinishStroke();
         }
-        if (Brush == 0 && Selected >= 0)
+        if (Brush == 0 && Document.CanEditTree(Selected))
         {
             if (ed_mouse(1) != 0)
             {
@@ -910,7 +1195,7 @@ struct Editor
             }
         }
 
-        if (!inside || control)
+        if (!inside || control || ed_layer_editable(WorldLayer) == 0)
         {
             return;
         }
@@ -937,18 +1222,20 @@ struct Editor
         {
             return;
         }
-        if (LastCell >= 0 && LastCell / 4096 == Layer)
+        if (HasLastCell && (TileBrush() || Brush == 10 || LastCell.Y == cast<float>(Layer) * 2.0f))
         {
-            Vector3 previous = Vector3(cast<float>(LastCell % 64) - 32.0f, cell.Y,
-                                       cast<float>((LastCell / 64) % 64) - 32.0f);
-            int steps = cast<int>(Max(Abs(cell.X - previous.X), Abs(cell.Z - previous.Z)) * 0.5f);
+            Vector3 previous = LastCell;
+            float distance =
+                Max(Max(Abs(cell.X - previous.X), Abs(cell.Z - previous.Z)), Abs(cell.Y - previous.Y));
+            int steps = cast<int>(Min(cast<float>(Capacity), distance * 0.5f));
 
             for (int i = 1; i < steps; i++)
             {
                 Vector3 point =
                     Add(previous, Scale(Subtract(cell, previous), cast<float>(i) / cast<float>(steps)));
-                point.X = cast<float>(cast<int>((point.X + 32.0f) * 0.5f)) * 2.0f - 31.0f;
-                point.Z = cast<float>(cast<int>((point.Z + 32.0f) * 0.5f)) * 2.0f - 31.0f;
+                point.X = GridFloor(point.X * 0.5f) * 2.0f + 1.0f;
+                point.Z = GridFloor(point.Z * 0.5f) * 2.0f + 1.0f;
+                point.Y = GridFloor(point.Y * 0.5f + 0.5f) * 2.0f;
                 PaintCell(point);
             }
         }
@@ -958,13 +1245,32 @@ struct Editor
 
     public void PaintCell(Vector3 cell)
     {
-        int key = cast<int>(cell.X + 32.0f) + cast<int>(cell.Z + 32.0f) * 64 + Layer * 4096;
-        if (LastCell == key)
+        if (ed_layer_editable(WorldLayer) == 0)
         {
             return;
         }
-        LastCell = key;
+        if (HasLastCell && LastCell.X == cell.X && LastCell.Y == cell.Y && LastCell.Z == cell.Z)
+        {
+            return;
+        }
+        LastCell = cell;
+        HasLastCell = true;
+        Document.ActiveLayer = WorldLayer;
         int existing = Document.Cell(cell.X, cell.Y, cell.Z, Brush);
+        if (existing >= 0 && !Document.CanEditTree(existing))
+        {
+            return;
+        }
+        if (Brush == 9)
+        {
+            for (int i = 0; i < Capacity; i++)
+            {
+                if (Document.Data[i * Stride] == 9.0f && !Document.CanEditTree(i))
+                {
+                    return;
+                }
+            }
+        }
 
         if (Brush == 10)
         {
@@ -981,12 +1287,16 @@ struct Editor
         if (Brush == 6 || Brush == 8)
         {
             asset = ed_asset_id();
+            if (TileBrush())
+            {
+                asset = TileAsset;
+            }
             int expected = 2;
             if (Brush == 8)
             {
                 expected = 3;
             }
-            if (ed_asset_kind(asset) != expected)
+            if (ed_asset_kind(asset) != expected && !(expected == 2 && ed_asset_kind(asset) == 5))
             {
                 ed_status("Select a matching model or sound in Resources first.");
                 return;
@@ -1016,6 +1326,11 @@ struct Editor
         Changed = Changed || Selected >= 0;
     }
 
+    public bool LayerVisible(int layer)
+    {
+        return ed_layer_visible(layer) != 0 && (!SoloLayer || layer == WorldLayer);
+    }
+
     public void Render()
     {
         if (!Playing)
@@ -1037,7 +1352,7 @@ struct Editor
         for (int i = 0; i < Capacity; i++)
         {
             int at = i * Stride;
-            if (Document.Data[at] == 7.0f)
+            if (Document.Data[at] == 7.0f && (Playing || LayerVisible(cast<int>(Document.Data[at + 15]))))
             {
                 ox_light(1, Document.Data[at + 1], Document.Data[at + 2], Document.Data[at + 3],
                          Palette(cast<int>(Document.Data[at + 9])), Document.Data[at + 11], 12.0f);
@@ -1050,7 +1365,8 @@ struct Editor
         {
             int at = i * Stride;
             int kind = cast<int>(Document.Data[at]);
-            if (kind == 0 || (Playing && kind >= 7))
+            if (kind == 0 || (Playing && kind >= 7) ||
+                (!Playing && !LayerVisible(cast<int>(Document.Data[at + 15]))))
             {
                 continue;
             }
@@ -1109,22 +1425,48 @@ struct Editor
         {
             if (Grid)
             {
-                ed_grid(cast<float>(Layer) * 2.0f + 0.008f);
+                ed_grid(cast<float>(Layer) * 2.0f + 0.008f, Camera.Position.X, Camera.Position.Z);
             }
-            if (Selected >= 0)
+            if (Selected >= 0 && LayerVisible(cast<int>(Document.Data[Selected * Stride + 15])))
             {
                 int at = Selected * Stride;
-                ed_object_outline(&Document.Data[at]);
-                if (Brush == 0 && !Flying)
+                if (IsWorldTile(&Document.Data[0], Selected))
+                {
+                    Bounds cells = TileCells(MakePrimitive(&Document.Data[0], Selected));
+                    ed_outline(cells.Low.X + cells.High.X, cells.Low.Y * 2.0f, cells.Low.Z + cells.High.Z,
+                               (cells.High.X - cells.Low.X) * 2.0f, (cells.High.Y - cells.Low.Y) * 2.0f,
+                               (cells.High.Z - cells.Low.Z) * 2.0f, 0xFFC879FFu);
+                }
+                else
+                {
+                    ed_object_outline(&Document.Data[at]);
+                }
+                if (Brush == 0 && !Flying && Document.CanEditTree(Selected))
                 {
                     ed_gizmo_draw(&Document.Data[at], GizmoMode);
                 }
             }
 
             Vector3 cell = Vector3(0.0f, 0.0f, 0.0f);
-            if (Brush > 0 && ed_mouse(0) != 0 && !Flying && CellPoint(&cell))
+            if (Brush > 0 && ed_layer_editable(WorldLayer) != 0 && ed_mouse(0) != 0 && !Flying &&
+                CellPoint(&cell))
             {
-                ed_outline(cell.X, cell.Y, cell.Z, 2.0f, 0.06f, 2.0f, 0x6BE0C0FFu);
+                if (TileBrush())
+                {
+                    Bounds cells = TileCells(TilePlacement(TileAsset, cell, Rotation));
+                    uint color = 0x6BE0C0FFu;
+                    if (!TileSpaceFree(&Document.Data[0], cells, WorldLayer, -1))
+                    {
+                        color = 0xFF6666FFu;
+                    }
+                    ed_outline(cells.Low.X + cells.High.X, cells.Low.Y * 2.0f, cells.Low.Z + cells.High.Z,
+                               (cells.High.X - cells.Low.X) * 2.0f, (cells.High.Y - cells.Low.Y) * 2.0f,
+                               (cells.High.Z - cells.Low.Z) * 2.0f, color);
+                }
+                else
+                {
+                    ed_outline(cell.X, cell.Y, cell.Z, 2.0f, 0.06f, 2.0f, 0x6BE0C0FFu);
+                }
             }
         }
 

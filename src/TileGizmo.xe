@@ -1,0 +1,272 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+struct TileGizmo
+{
+    public bool Active;
+    public int Handle;
+    public Vector3 Pivot;
+    public Vector3 Normal;
+    public Vector3 Hit;
+    public ScreenPoint Mouse;
+    public float Radius;
+    public float Angle;
+    public float TotalAngle;
+
+    public int Update(float *data, float *selection, float *camera, float *input, float *values, float *display)
+    {
+        for (int i = 0; i < 12; i++)
+        {
+            display[i] = 0.0f;
+        }
+        Vector3 low = Vector3(10000.0f, 10000.0f, 10000.0f);
+        Vector3 high = Vector3(-10000.0f, -10000.0f, -10000.0f);
+        bool any = false;
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (data[i * 4] != 0.0f && selection[i] != 0.0f)
+            {
+                Vector3 p = Vector3(data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
+                low = Vector3(Min(low.X, p.X), Min(low.Y, p.Y), Min(low.Z, p.Z));
+                high = Vector3(Max(high.X, p.X), Max(high.Y, p.Y), Max(high.Z, p.Z));
+                any = true;
+            }
+        }
+        if (!any && !Active)
+        {
+            return 0;
+        }
+        int tool = cast<int>(input[2]);
+        ScreenPoint mouse = ScreenPoint(input[0], input[1]);
+        Vector3 forward =
+            Normalize(Vector3(camera[3] - camera[0], camera[4] - camera[1], camera[5] - camera[2]));
+        Vector3 pivot = Scale(Add(low, high), 0.5f);
+        if (Active)
+        {
+            pivot = Pivot;
+        }
+        float depth = Dot(Subtract(pivot, Vector3(camera[0], camera[1], camera[2])), forward);
+        if (depth < 0.01f && !Active)
+        {
+            return 0;
+        }
+        float radius = Max(0.01f, depth * tanf(camera[9] * Pi / 360.0f) * 160.0f / camera[13]);
+        if (Active)
+        {
+            radius = Radius;
+        }
+        ScreenPoint center = ProjectGizmo(camera, pivot);
+        int hit = -1;
+        float nearest = 9.0f;
+        if (input[3] != 0.0f && input[4] == 0.0f)
+        {
+            for (int a = 0; a < 3; a++)
+            {
+                if (tool == 1)
+                {
+                    for (int s = 0; s < 64; s++)
+                    {
+                        float d = SegmentDistance(
+                            mouse,
+                            ProjectGizmo(camera,
+                                         GizmoRing(pivot, a, cast<float>(s) * 2.0f * Pi / 64.0f, radius)),
+                            ProjectGizmo(
+                                camera, GizmoRing(pivot, a, cast<float>(s + 1) * 2.0f * Pi / 64.0f, radius)));
+                        if (d < nearest)
+                        {
+                            nearest = d;
+                            hit = a;
+                        }
+                    }
+                }
+                else
+                {
+                    ScreenPoint end = ProjectGizmo(camera, Add(pivot, Scale(GizmoAxis(a), radius)));
+                    if (ScreenDistance(center, end) < 12.0f)
+                    {
+                        continue;
+                    }
+                    ScreenPoint start = ScreenPoint(center.X + (end.X - center.X) * 0.18f,
+                                                    center.Y + (end.Y - center.Y) * 0.18f);
+                    float d = SegmentDistance(mouse, start, end);
+                    if (d < nearest)
+                    {
+                        nearest = d;
+                        hit = a;
+                    }
+                }
+            }
+            if (tool != 1 && ScreenDistance(mouse, center) < 8.0f)
+            {
+                hit = 3;
+            }
+        }
+        bool consumed = Active;
+        float[] ray = float[6];
+        ed_screen_ray(camera, mouse.X, mouse.Y, cast<int>(camera[12]), cast<int>(camera[13]), &ray[0]);
+        if (!Active && hit >= 0 && input[7] != 0.0f)
+        {
+            Vector3 normal = forward;
+            if (tool == 1)
+            {
+                normal = GizmoAxis(hit);
+            }
+            else if (hit < 3)
+            {
+                normal = Normalize(Subtract(forward, Scale(GizmoAxis(hit), Dot(forward, GizmoAxis(hit)))));
+            }
+            Vector3 start = Vector3(0.0f, 0.0f, 0.0f);
+            if (GizmoPlaneHit(&ray[0], pivot, normal, &start))
+            {
+                Active = true;
+                Handle = hit;
+                Pivot = pivot;
+                Normal = normal;
+                Hit = start;
+                Mouse = mouse;
+                Radius = radius;
+                Angle = 0.0f;
+                TotalAngle = 0.0f;
+                if (tool == 1)
+                {
+                    Vector3 v = Subtract(start, pivot);
+                    Angle = atan2f(Dot(v, GizmoAxis((hit + 2) % 3)), Dot(v, GizmoAxis((hit + 1) % 3)));
+                }
+                consumed = true;
+            }
+        }
+        int action = 0;
+        if (Active)
+        {
+            if (input[8] != 0.0f)
+            {
+                action = 17;
+                Active = false;
+            }
+            else
+            {
+                Vector3 current = Vector3(0.0f, 0.0f, 0.0f);
+                bool valid = GizmoPlaneHit(&ray[0], Pivot, Normal, &current);
+                bool snap = input[5] != 0.0f;
+                if (valid)
+                {
+                    for (int i = 0; i < 16; i++)
+                    {
+                        values[i] = 0.0f;
+                    }
+                    values[6] = values[7] = values[8] = 1.0f;
+                    values[9] = pivot.X;
+                    values[10] = pivot.Y;
+                    values[11] = pivot.Z;
+                    int a = Handle;
+                    Vector3 delta = Subtract(current, Hit);
+                    if (tool == 0)
+                    {
+                        if (a < 3)
+                        {
+                            delta = Scale(GizmoAxis(a), Dot(delta, GizmoAxis(a)));
+                        }
+                        values[0] = GizmoSnap(delta.X, input[6], snap);
+                        values[1] = GizmoSnap(delta.Y, input[6], snap);
+                        values[2] = GizmoSnap(delta.Z, input[6], snap);
+                    }
+                    else if (tool == 1)
+                    {
+                        Vector3 v = Subtract(current, pivot);
+                        float angle = atan2f(Dot(v, GizmoAxis((a + 2) % 3)), Dot(v, GizmoAxis((a + 1) % 3)));
+                        float step = angle - Angle;
+                        if (step > Pi)
+                        {
+                            step -= 2.0f * Pi;
+                        }
+                        if (step < -Pi)
+                        {
+                            step += 2.0f * Pi;
+                        }
+                        TotalAngle += step;
+                        Angle = angle;
+                        values[3 + a] = GizmoSnap(TotalAngle * 180.0f / Pi, 15.0f, snap);
+                    }
+                    else
+                    {
+                        float amount = (mouse.X - Mouse.X + Mouse.Y - mouse.Y) / 100.0f;
+                        if (a < 3)
+                        {
+                            amount = Dot(delta, GizmoAxis(a)) / radius;
+                        }
+                        float scale = Clamp(1.0f + amount, 0.01f, 100.0f);
+                        if (snap)
+                        {
+                            scale = Max(0.1f, roundf(scale * 10.0f) / 10.0f);
+                        }
+                        if (a < 3)
+                        {
+                            values[6 + a] = scale;
+                        }
+                        else
+                        {
+                            values[6] = values[7] = values[8] = scale;
+                        }
+                    }
+                    action = 25;
+                }
+                if (input[9] == 0.0f)
+                {
+                    if (valid)
+                    {
+                        values[15] = 1.0f;
+                    }
+                    else
+                    {
+                        action = 16;
+                    }
+                    Active = false;
+                }
+            }
+        }
+        Vector3 drawPivot = pivot;
+        if (tool == 0 && any)
+        {
+            drawPivot = Scale(Add(low, high), 0.5f);
+        }
+        float drawDepth = Dot(Subtract(drawPivot, Vector3(camera[0], camera[1], camera[2])), forward);
+        display[0] = 1.0f;
+        if (Active)
+        {
+            display[1] = 1.0f;
+        }
+        display[2] = cast<float>(Handle);
+        display[3] = Pivot.X;
+        display[4] = Pivot.Y;
+        display[5] = Pivot.Z;
+        display[6] = drawPivot.X;
+        display[7] = drawPivot.Y;
+        display[8] = drawPivot.Z;
+        display[9] = Max(0.01f, drawDepth * tanf(camera[9] * Pi / 360.0f) * 160.0f / camera[13]);
+        display[10] = cast<float>(hit);
+        if (consumed)
+        {
+            display[11] = 1.0f;
+        }
+        return action;
+    }
+}
+
+static struct TileGizmoService
+{
+    public static TileGizmo *State;
+}
+
+extern void ed_bind_tile_gizmo(function int(int, float *, float *, float *, float *, float *, float *) * callback);
+
+int TileGizmoDispatch(int operation, float *data, float *selection, float *camera, float *input,
+                      float *values, float *display)
+{
+    if (operation == 1)
+    {
+        TileGizmoService.State->Active = false;
+        return 0;
+    }
+    return TileGizmoService.State->Update(data, selection, camera, input, values, display);
+}

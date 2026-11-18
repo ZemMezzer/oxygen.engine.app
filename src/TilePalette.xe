@@ -1,0 +1,315 @@
+using Xenon.Text;
+using Xenon.Collections;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+extern void ed_bind_tile_palette(function int(int, float *, int) * callback);
+extern int ed_tile_catalog_count(int kind);
+extern readonly byte *ed_tile_catalog_text(int kind, int index);
+extern void ed_tile_catalog_scan();
+extern uint ed_tile_thumbnail(int index, int create);
+extern void ed_tile_new_request();
+extern void ed_tile_open_request(readonly byte *path);
+extern void ed_tile_selection_view(int operation, readonly byte *path);
+extern void ed_tile_drop_area();
+extern void ui_window_focus();
+extern int ui_image_button(readonly byte *label, uint texture, float width, float height, int selected);
+
+struct TilePalette
+{
+    public Vector<String> Selection;
+    public String SelectionSet;
+    public byte[] NewName;
+
+    public TilePalette()
+    {
+        Selection = Vector<String>();
+        SelectionSet = String();
+        NewName = new byte[128];
+    }
+
+    public ~TilePalette()
+    {
+        delete (NewName);
+    }
+
+    public int Find(readonly String &path)
+    {
+        for (int i = 0; i < Selection.Count; i++)
+        {
+            if (Selection.Get(i)->Equals(path))
+            {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public void Publish()
+    {
+        ed_tile_selection_view(0, SelectionSet.CString);
+        for (int i = 0; i < Selection.Count; i++)
+        {
+            ed_tile_selection_view(1, Selection.Get(i)->CString);
+        }
+    }
+
+    public void Synchronize()
+    {
+        String current = String(ed_tile_catalog_text(5, 0));
+        if (!SelectionSet.Equals(current))
+        {
+            SelectionSet = current;
+            Selection.Clear();
+            Publish();
+        }
+    }
+
+    public void Undo(bool redo)
+    {
+        int operation = 4;
+        if (redo)
+        {
+            operation = 5;
+        }
+        if (TileSetsDispatch(operation, "", 0, null, "", 0) != 0)
+        {
+            Selection.Clear();
+            SelectionSet = String(ed_tile_catalog_text(5, 0));
+            Publish();
+            ed_tile_selection_view(2, "");
+        }
+    }
+
+    public bool Drop(int id)
+    {
+        Synchronize();
+        if (SelectionSet.ByteLength == 0 || ed_asset_kind(id) != 5)
+        {
+            return false;
+        }
+        String path = String(ed_asset_path(id));
+        readonly byte *pointer = path.CString;
+        if (TileSetsDispatch(2, SelectionSet.CString, 1, &pointer, "", 1) != 0)
+        {
+            Selection.Clear();
+            Selection.Add(path);
+            Publish();
+            ed_tile_selection_view(2, "");
+            ui_window_focus();
+            ed_status("Added tile to tileset.");
+            return true;
+        }
+        ed_status("Cannot add this tile to the tileset.");
+        return false;
+    }
+
+    public void Draw(float *state)
+    {
+        ed_tile_catalog_scan();
+        Synchronize();
+        ui_disabled_begin(UiFlag(state[6] != 0.0f));
+        if (UiButton("New Tile") && ed_tile_guard() != 0)
+        {
+            ed_tile_new_request();
+        }
+        ui_same_line();
+        if (UiButton("New Tileset"))
+        {
+            NewName[0] = cast<byte>(0);
+            ed_tile_error_view("");
+            ui_popup_open("New Tileset");
+        }
+        if (ui_popup_begin("New Tileset") != 0)
+        {
+            ui_input_text("Name", &NewName[0], 128, 0);
+            if (UiButton("Create") && NewName[0] != cast<byte>(0))
+            {
+                if (TileAssetsDispatch(2, "", "", &NewName[0], "", null) != 0)
+                {
+                    ed_tile_selection_view(2, "");
+                    ui_popup_close();
+                }
+            }
+            ui_same_line();
+            if (UiButton("Cancel"))
+            {
+                ui_popup_close();
+            }
+            ui_text_wrapped(ed_tile_catalog_text(6, 0));
+            ui_popup_end();
+        }
+        String current = String(ed_tile_catalog_text(5, 0));
+        String title = String("Create a tileset");
+        for (int i = 0; i < ed_tile_catalog_count(0); i++)
+        {
+            if (String(ed_tile_catalog_text(0, i)).Equals(current))
+            {
+                title = String(ed_tile_catalog_text(1, i));
+                break;
+            }
+        }
+        if (ui_combo_begin("Tileset", title.CString) != 0)
+        {
+            for (int i = 0; i < ed_tile_catalog_count(0); i++)
+            {
+                String path = String(ed_tile_catalog_text(0, i));
+                String name = String(ed_tile_catalog_text(1, i));
+                if (ui_selectable(name.CString, UiFlag(path.Equals(current))) != 0)
+                {
+                    ed_tileset_view(2, path.CString);
+                }
+            }
+            ui_combo_end();
+        }
+        Synchronize();
+        ui_separator();
+        int visible = 0;
+        int columns = cast<int>(ui_available_width() / 105.0f);
+        if (columns < 1)
+        {
+            columns = 1;
+        }
+        if (ui_table_begin("Tile grid", columns, 2) != 0)
+        {
+            int budget = 1;
+            for (int i = 0; i < ed_tile_catalog_count(1); i++)
+            {
+                if (!String(ed_tile_catalog_text(4, i)).Equals(SelectionSet))
+                {
+                    continue;
+                }
+                visible++;
+                String path = String(ed_tile_catalog_text(2, i));
+                String name = String(ed_tile_catalog_text(3, i));
+                ui_table_next();
+                ui_push_id(i);
+                uint image = ed_tile_thumbnail(i, 0);
+                if (image == 0u && budget > 0)
+                {
+                    image = ed_tile_thumbnail(i, 1);
+                    budget--;
+                }
+                bool selected = Find(path) >= 0;
+                bool clicked = false;
+                if (image != 0u)
+                {
+                    clicked = ui_image_button("Preview", image, 88.0f, 88.0f, UiFlag(selected)) != 0;
+                }
+                else
+                {
+                    clicked = ui_card_button("Loading", 88.0f, 88.0f, UiFlag(selected)) != 0;
+                }
+                if (clicked)
+                {
+                    bool additive = ui_query(4) != 0;
+                    if (!additive)
+                    {
+                        Selection.Clear();
+                    }
+                    int found = Find(path);
+                    if (found < 0)
+                    {
+                        Selection.Add(path);
+                    }
+                    else if (additive)
+                    {
+                        Selection.RemoveAt(found);
+                    }
+                    ed_asset_selected_view(RegisterProjectAsset(path));
+                    QueueEditorCommand(71);
+                    Publish();
+                }
+                if (ui_item_query(7) != 0 && ed_tile_guard() != 0)
+                {
+                    ed_tile_open_request(path.CString);
+                }
+                if (ui_context_begin() != 0)
+                {
+                    if (ui_menu_item("Edit Tile", 1) != 0 && ed_tile_guard() != 0)
+                    {
+                        ed_tile_open_request(path.CString);
+                    }
+                    ui_popup_end();
+                }
+                ui_text_wrapped(name.CString);
+                ui_pop_id();
+            }
+            ui_table_end();
+        }
+        if (visible == 0)
+        {
+            ui_text_wrapped("Create a tileset and your first tile. Saved tiles appear here.");
+        }
+        if (state[6] == 0.0f)
+        {
+            ed_tile_drop_area();
+            if (ui_query(0) != 0 && ui_query(1) == 0 && ui_query(2) == 0)
+            {
+                if (UiKey(261) && Selection.Count > 0)
+                {
+                    unique<readonly byte *[]> paths = new readonly byte *[Selection.Count];
+                    for (int i = 0; i < Selection.Count; i++)
+                    {
+                        paths[i] = Selection.Get(i)->CString;
+                    }
+                    if (TileSetsDispatch(3, SelectionSet.CString, Selection.Count, &paths[0], "", 1) != 0)
+                    {
+                        Selection.Clear();
+                        Publish();
+                        ed_tile_selection_view(2, "");
+                        ed_status("Removed from tileset. Asset files are unchanged.");
+                    }
+                }
+                if (ui_query(4) != 0 && UiKey(90))
+                {
+                    Undo(false);
+                }
+                if (ui_query(4) != 0 && UiKey(89))
+                {
+                    Undo(true);
+                }
+            }
+        }
+        ui_disabled_end();
+    }
+}
+
+static struct TilePaletteService
+{
+    public static TilePalette *Panel;
+}
+
+int TilePaletteDispatch(int operation, float* state, int value)
+{
+    if (operation == 0)
+    {
+        TilePaletteService.Panel->Draw(state);
+    }
+    if (operation == 1)
+    {
+        return UiFlag(TilePaletteService.Panel->Drop(value));
+    }
+    if (operation == 2)
+    {
+        TilePaletteService.Panel->Undo(value != 0);
+    }
+    if (operation == 3)
+    {
+        TilePaletteService.Panel->Selection.Clear();
+        TilePaletteService.Panel->SelectionSet = String();
+    }
+    if (operation == 4)
+    {
+        TilePaletteService.Panel->Selection.Clear();
+        TilePaletteService.Panel->SelectionSet = String(ed_tile_catalog_text(5, 0));
+        TilePaletteService.Panel->Publish();
+    }
+    if (operation == 5)
+    {
+        TilePaletteService.Panel->Selection.Add(String(ed_asset_path(value)));
+        TilePaletteService.Panel->Publish();
+    }
+    return 0;
+}

@@ -1,0 +1,59 @@
+namespace OxygenEditor;
+
+// Small C ABI for ImGui widgets. Editor decisions and persistent form state are Xenon-owned.
+extern int ui_button(readonly byte *label, float width, float height);
+extern int ui_query(int query);
+extern int ui_key(int key);
+extern int ui_input_text(readonly byte *label, byte *value, int capacity, int flags);
+extern int ui_popup_begin(readonly byte *title);
+extern void ui_popup_open(readonly byte *title);
+extern void ui_popup_close();
+extern void ui_popup_end();
+extern void ui_same_line();
+extern void ui_separator();
+extern void ui_text(readonly byte *text);
+extern void ui_focus_keyboard();
+extern void ui_disabled_begin(int disabled);
+extern void ui_disabled_end();
+extern int ui_combo_begin(readonly byte *label, readonly byte *preview);
+extern void ui_combo_end();
+extern int ui_selectable(readonly byte *label, int selected);
+extern void ui_push_id(int id);
+extern void ui_pop_id();
+extern int ui_radio(readonly byte *label, int selected);
+extern int ui_checkbox(readonly byte *label, int *value);
+extern int ui_table_begin(readonly byte *label, int columns, int flags);
+extern void ui_table_column(readonly byte *name, float width);
+extern void ui_table_headers();
+extern void ui_table_row();
+extern void ui_table_next();
+extern void ui_table_end();
+
+int UiFlag(bool value)
+{
+    if (value)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+bool UiButton(readonly byte *label)
+{
+    return ui_button(label, 0.0f, 0.0f) != 0;
+}
+
+bool UiKey(int key)
+{
+    return ui_key(key) != 0;
+}
+
+bool UiKeyboardAvailable(float *state)
+{
+    return state[6] == 0.0f && ui_query(0) != 0 && ui_query(1) == 0 && ui_query(2) == 0 && ui_query(3) == 0;
+}
+
+void QueueEditorCommand(int action)
+{
+    WorkspaceService.Commands->Add(action);
+}

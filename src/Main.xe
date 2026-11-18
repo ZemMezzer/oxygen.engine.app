@@ -8,19 +8,31 @@ int Main()
     {
         return 1;
     }
+    InitializeEditorLogic();
     if (ed_init() == 0)
     {
+        ed_close();
+        CloseEditorLogic();
         CloseWindow();
         return 1;
     }
     Editor *editor = new Editor();
+    TileDocument *tile = new TileDocument();
     int smoke = Option("OXYGEN_EDITOR_SMOKE");
     int frames = 0;
     int failures = 0;
+    int meshSlot = -1;
 
     if (smoke != 0)
     {
         failures += EditorChecks(editor);
+        int meshAsset = ed_asset_find("Props/Crate.obj");
+        meshSlot = editor->Document.Add(6, Vector3(10.0f, 0.0f, 10.0f), 25.0f, meshAsset, 0);
+        if (meshAsset == 0 || meshSlot < 0)
+        {
+            failures++;
+        }
+        editor->Document.Commit();
         int before = editor->Document.Count();
         editor->Document.Add(2, Vector3(5.0f, 0.0f, 1.0f), 0.0f, 0, 2);
         editor->Document.Commit();
@@ -67,6 +79,7 @@ int Main()
         BeginFrame(0x13171EFFu);
         editor->FillUI();
         int action = ed_ui(&editor->UI[0], &editor->Document.Data[0]);
+        tile->Update();
         editor->Action(action);
         editor->Update(dt);
         editor->Render();
@@ -83,6 +96,29 @@ int Main()
             if (!editor->Playing)
             {
                 failures++;
+            }
+            else if (meshSlot >= 0)
+            {
+                int slot = editor->PlaySlots[meshSlot];
+                Scene *scene = editor->Game->Rooms[0].Value;
+                if (slot < 0 || scene->Objects[slot].Body.Handle == 0)
+                {
+                    failures++;
+                    Log("FAIL: editor mesh collider in Play.");
+                }
+                else
+                {
+                    RayHit hit = Raycast(scene->Physics, Vector3(10.0f, 8.0f, 10.0f),
+                                         Vector3(0.0f, -1.0f, 0.0f), 10.0f, 0);
+                    if (hit.Entity != scene->Objects[slot].Id)
+                    {
+                        failures++;
+                    }
+                    else
+                    {
+                        Log("PASS: editor creates model triangle collider in Play.");
+                    }
+                }
             }
         }
         if (smoke != 0 && frames == 80)
@@ -113,8 +149,10 @@ int Main()
         }
     }
 
+    delete (tile);
     delete (editor);
     ed_close();
+    CloseEditorLogic();
     CloseWindow();
     return failures;
 }

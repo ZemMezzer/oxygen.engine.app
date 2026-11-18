@@ -1,0 +1,176 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+extern void ed_bind_tile_viewport(function int(int, float *, float *, float *, float *, float *) * callback);
+
+void FrameTile(float *data, float *output)
+{
+    Vector3 low = Vector3(1000.0f, 1000.0f, 1000.0f);
+    Vector3 high = Vector3(-1000.0f, -1000.0f, -1000.0f);
+    bool any = false;
+    for (int i = 0; i < TileVertices; i++)
+    {
+        if (data[i * 4] == 0.0f)
+        {
+            continue;
+        }
+        Vector3 p = TilePoint(data, i);
+        low = Vector3(Min(low.X, p.X), Min(low.Y, p.Y), Min(low.Z, p.Z));
+        high = Vector3(Max(high.X, p.X), Max(high.Y, p.Y), Max(high.Z, p.Z));
+        any = true;
+    }
+    Vector3 center = Vector3(0.0f, 1.0f, 0.0f);
+    float radius = 3.0f;
+    if (any)
+    {
+        center = Scale(Add(low, high), 0.5f);
+        radius = Max(0.5f, Length(Subtract(high, low)));
+    }
+    output[0] = center.X;
+    output[1] = center.Y;
+    output[2] = center.Z;
+    output[3] = radius;
+}
+
+void UpdateTileCamera(float *data, float *state, float *input, float *camera)
+{
+    bool navigate = input[0] != 0.0f && input[1] == 0.0f;
+    if (navigate)
+    {
+        if (input[2] != 0.0f)
+        {
+            state[0] -= input[4] * 0.008f;
+            state[1] = Clamp(state[1] + input[5] * 0.008f, -1.5f, 1.5f);
+        }
+        state[2] = Clamp(state[2] * expf(-input[6] * 0.12f), 0.2f, 500.0f);
+        if (input[7] != 0.0f)
+        {
+            float[] frame = float[4];
+            FrameTile(data, &frame[0]);
+            state[3] = frame[0];
+            state[4] = frame[1];
+            state[5] = frame[2];
+            state[2] = frame[3] * 1.6f;
+        }
+    }
+    Vector3 target = Vector3(state[3], state[4], state[5]);
+    Vector3 position = Add(target, Vector3(Sin(state[0]) * Cos(state[1]) * state[2], Sin(state[1]) * state[2],
+                                           Cos(state[0]) * Cos(state[1]) * state[2]));
+    camera[0] = position.X;
+    camera[1] = position.Y;
+    camera[2] = position.Z;
+    camera[3] = target.X;
+    camera[4] = target.Y;
+    camera[5] = target.Z;
+    camera[6] = 0.0f;
+    camera[7] = 1.0f;
+    camera[8] = 0.0f;
+    camera[9] = 50.0f;
+    camera[10] = 0.0f;
+    camera[11] = 0.0f;
+    camera[12] = input[8];
+    camera[13] = input[9];
+    if (navigate && input[3] != 0.0f)
+    {
+        Vector3 forward = Normalize(Subtract(target, position));
+        Vector3 right = Normalize(Cross(forward, Vector3(0.0f, 1.0f, 0.0f)));
+        Vector3 up = Cross(right, forward);
+        target = Add(target, Add(Scale(right, -input[4] * state[2] * 0.002f),
+                                 Scale(up, input[5] * state[2] * 0.002f)));
+        state[3] = target.X;
+        state[4] = target.Y;
+        state[5] = target.Z;
+    }
+}
+
+void AtlasQuadUV(float *region, float *uv)
+{
+    uv[0] = region[0];
+    uv[1] = region[3];
+    uv[2] = region[2];
+    uv[3] = region[3];
+    uv[4] = region[2];
+    uv[5] = region[1];
+    uv[6] = region[0];
+    uv[7] = region[1];
+}
+
+int PlaceAtlasFace(float *data, float *ray, float *input, float *region, float *values)
+{
+    if (input[14] == 0.0f || input[15] != 0.0f || input[16] != 0.0f || input[0] < 0.0f || input[1] < 0.0f ||
+        input[0] >= input[2] || input[1] >= input[3])
+    {
+        return 0;
+    }
+    int plane = cast<int>(input[4]);
+    int axis = 2;
+    if (plane == 1)
+    {
+        axis = 1;
+    }
+    if (plane == 2)
+    {
+        axis = 0;
+    }
+    float denominator = ray[3 + axis];
+    if (Abs(denominator) <= 0.0001f)
+    {
+        return 0;
+    }
+    float distance = (input[5] - ray[axis]) / denominator;
+    if (distance <= 0.0f)
+    {
+        return 0;
+    }
+    float width = (region[2] - region[0]) * input[8] / input[10] * input[12];
+    float height = (region[3] - region[1]) * input[9] / input[11] * input[12];
+    if (input[13] == 0.0f || width <= 0.0f || height <= 0.0f)
+    {
+        return 0;
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        values[i] = GizmoSnap(ray[i] + ray[3 + i] * distance, input[7], input[6] != 0.0f);
+    }
+    values[axis] = input[5];
+    values[3] = width;
+    values[4] = height;
+    values[5] = cast<float>(plane);
+    values[6] = -1.0f;
+    AtlasQuadUV(region, values + 8);
+    if (input[17] != 0.0f)
+    {
+        for (int i = 0; i < TileFaces; i++)
+        {
+            if (data[TileFaceStart + i * TileFaceStride] == 0.0f)
+            {
+                values[6] = cast<float>(i);
+                break;
+            }
+        }
+        return 2;
+    }
+    return 1;
+}
+
+int TileViewportDispatch(int operation, float *data, float *state, float *input, float *uv, float *output)
+{
+    if (operation == 0)
+    {
+        UpdateTileCamera(data, state, input, output);
+    }
+    if (operation == 1)
+    {
+        return PlaceAtlasFace(data, state, input, uv, output);
+    }
+    if (operation == 2)
+    {
+        FrameTile(data, output);
+    }
+    if (operation == 3)
+    {
+        AtlasQuadUV(uv, output);
+    }
+    return 0;
+}

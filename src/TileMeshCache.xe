@@ -1,0 +1,97 @@
+using Xenon.Text;
+using Xenon.IO;
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+String TileModelPath(readonly String &relative)
+{
+    String directory = String(Path.GetDirectoryName(relative.AsView()));
+    String stem = String(Path.GetFileNameWithoutExtension(relative.AsView()));
+    return JoinPath(JoinPath(JoinPath(directory, String(".generated")), stem), String("model.oxmesh"));
+}
+
+void StoreUInt32(byte *bytes, int offset, uint value)
+{
+    for (int i = 0; i < 4; i++)
+    {
+        bytes[offset + i] = cast<byte>((value >> (i * 8)) & 255u);
+    }
+}
+
+bool ExportTileMesh(readonly String &relative, float *data, readonly TileMetadata &metadata)
+{
+    if (!SafeAssetPath(relative) || !ValidTile(data) ||
+        (metadata.Texture.ByteLength > 0 && !File.Exists(AssetFile(metadata.Texture))))
+    {
+        return false;
+    }
+    unique<float[]> vertices = new float[TileFaces * 6 * 8];
+    unique<ushort[]> indices = new ushort[TileFaces * 6];
+    int[] counts = int[3];
+    if (CompileTileMesh(data, &vertices[0], &indices[0], &counts[0]) == 0)
+    {
+        return false;
+    }
+    int size = 20 + metadata.Texture.ByteLength + counts[0] * 32 + counts[1] * 2;
+    unique<byte[]> bytes = new byte[size];
+    readonly byte *magic = "OXMESH02";
+    for (int i = 0; i < 8; i++)
+    {
+        bytes[i] = magic[i];
+    }
+    StoreUInt32(&bytes[0], 8, cast<uint>(counts[0]));
+    StoreUInt32(&bytes[0], 12, cast<uint>(counts[1]));
+    StoreUInt32(&bytes[0], 16, cast<uint>(metadata.Texture.ByteLength));
+    int offset = 20;
+    for (int i = 0; i < metadata.Texture.ByteLength; i++)
+    {
+        bytes[offset++] = metadata.Texture.CString[i];
+    }
+    uint *bits = cast<uint *>(cast<void *>(&vertices[0]));
+    for (int i = 0; i < counts[0] * 8; i++)
+    {
+        StoreUInt32(&bytes[0], offset, bits[i]);
+        offset += 4;
+    }
+    for (int i = 0; i < counts[1]; i++)
+    {
+        bytes[offset++] = cast<byte>(indices[i] & cast<ushort>(255));
+        bytes[offset++] = cast<byte>(indices[i] >> 8);
+    }
+    String output = AssetFile(TileModelPath(relative));
+    String parent = String(Path.GetDirectoryName(output.AsView()));
+    if (ed_fs_create_directories(parent.CString) == 0)
+    {
+        return false;
+    }
+    String temporary = output + ".tmp";
+    File.WriteAllBytes(temporary, ReadonlySpan<byte>(&bytes[0], size));
+    return ed_atomic_replace(temporary.CString, output.CString) != 0;
+}
+
+extern int ed_indexed_model(float *vertices, int vertexCount, ushort *indices, int indexCount, int texture);
+
+int LoadTileRuntimeModel(readonly String &relative)
+{
+    unique<float[]> data = new float[TileDataSize];
+    TileMetadata meta = TileMetadata();
+    if (!ReadTileFile(AssetFile(relative), &data[0], &meta) || !ExportTileMesh(relative, &data[0], meta))
+    {
+        return 0;
+    }
+    unique<float[]> vertices = new float[TileFaces * 6 * 8];
+    unique<ushort[]> indices = new ushort[TileFaces * 6];
+    int[] counts = int[3];
+    if (CompileTileMesh(&data[0], &vertices[0], &indices[0], &counts[0]) == 0 || counts[0] == 0 ||
+        counts[1] == 0)
+    {
+        return 0;
+    }
+    int texture = 0;
+    if (meta.Texture.ByteLength > 0)
+    {
+        texture = ed_asset_handle(RegisterProjectAsset(meta.Texture));
+    }
+    return ed_indexed_model(&vertices[0], counts[0], &indices[0], counts[1], texture);
+}

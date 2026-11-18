@@ -1,0 +1,173 @@
+using Oxygen;
+using Xenon.Text;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+extern void ed_bind_scene_toolbar(function void(float *) * callback);
+extern void ed_bind_layout(function void(int, int *) * callback);
+extern int ui_fps();
+
+void DrawSceneToolbar(float *state)
+{
+    ui_disabled_begin(UiFlag(state[6] != 0.0f));
+    if (UiButton("Select"))
+    {
+        QueueEditorCommand(20);
+    }
+    ui_same_line();
+    if (UiButton("Erase"))
+    {
+        QueueEditorCommand(30);
+    }
+    ui_same_line();
+    if (UiButton("Light"))
+    {
+        QueueEditorCommand(27);
+    }
+    ui_same_line();
+    if (UiButton("Player start"))
+    {
+        QueueEditorCommand(29);
+    }
+    ui_same_line();
+    if (UiButton("Height -"))
+    {
+        QueueEditorCommand(40);
+    }
+    ui_same_line();
+    StringBuilder height = StringBuilder();
+    height.Append(cast<int>(state[1]));
+    ui_text(height.ToString().CString);
+    ui_same_line();
+    if (UiButton("Height +"))
+    {
+        QueueEditorCommand(41);
+    }
+    ui_same_line();
+    if (UiButton("Brush turn"))
+    {
+        QueueEditorCommand(42);
+    }
+    ui_disabled_end();
+    ui_disabled_begin(UiFlag(state[6] != 0.0f));
+    int layer = cast<int>(state[24]);
+    ui_item_width(140.0f);
+    if (ui_combo_begin("World layer", LayerName(layer).CString) != 0)
+    {
+        for (int i = 0; i < ed_layer_count(); i++)
+        {
+            if (ui_selectable(LayerName(i).CString, UiFlag(layer == i)) != 0)
+            {
+                QueueEditorCommand(1000 + i);
+            }
+        }
+        ui_combo_end();
+    }
+    ui_same_line();
+    int solo = UiFlag(state[25] != 0.0f);
+    if (ui_checkbox("Isolate", &solo) != 0)
+    {
+        QueueEditorCommand(108);
+    }
+    for (int i = 0; i < 3; i++)
+    {
+        if (i > 0)
+        {
+            ui_same_line();
+        }
+        readonly byte *name = "Move [W]";
+        if (i == 1)
+        {
+            name = "Rotate [E]";
+        }
+        if (i == 2)
+        {
+            name = "Scale [R]";
+        }
+        bool selected = state[0] == 0.0f && state[20] == cast<float>(i + 1);
+        if (ui_card_button(name, 0.0f, 0.0f, UiFlag(selected)) != 0)
+        {
+            QueueEditorCommand(80 + i);
+        }
+    }
+    ui_disabled_end();
+    ui_same_line();
+    readonly byte *play = "Play [F5]";
+    if (state[6] != 0.0f)
+    {
+        play = "Stop [Esc]";
+    }
+    if (UiButton(play))
+    {
+        QueueEditorCommand(6);
+    }
+    ui_same_line();
+    StringBuilder fps = StringBuilder();
+    fps.Append(ui_fps());
+    fps.Append(" FPS");
+    ui_text_disabled(fps.ToString().CString);
+}
+
+void LayoutDispatch(int operation, int *values)
+{
+    if (Option("OXYGEN_EDITOR_SMOKE") != 0)
+    {
+        return;
+    }
+    try
+    {
+        String path = JoinPath(String(ed_application_directory()), String("oxygen-editor-layout.ini.panels"));
+        if (operation == 0)
+        {
+            if (!File.Exists(path))
+            {
+                return;
+            }
+            TextReader reader = TextReader(File.ReadAllText(path));
+            if (!reader.Token().Equals(String("OXYGEN_PANELS")))
+            {
+                return;
+            }
+            int version = reader.Integer();
+            if (version != 1 && version != 2)
+            {
+                return;
+            }
+            int count = 6;
+            if (version == 1)
+            {
+                count = 5;
+            }
+            int[] loaded = int[6];
+            loaded[5] = 1;
+            for (int i = 0; i < count; i++)
+            {
+                int value = reader.Integer();
+                if (value != 0 && value != 1)
+                {
+                    return;
+                }
+                loaded[i] = value;
+            }
+            for (int i = 0; i < 6; i++)
+            {
+                values[i] = loaded[i];
+            }
+        }
+        else
+        {
+            StringBuilder text = StringBuilder();
+            text.Append("OXYGEN_PANELS 2\n");
+            for (int i = 0; i < 6; i++)
+            {
+                text.Append(values[i]);
+                text.Append(" ");
+            }
+            SaveTextAtomic(path, text.ToString());
+        }
+    }
+    catch (...)
+    {
+    }
+}

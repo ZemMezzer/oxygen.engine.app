@@ -1,0 +1,196 @@
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+extern void ed_bind_hierarchy(function void(float *, float *) * callback);
+extern void ed_row_view(int selected);
+extern int ui_tree(readonly byte *id, readonly byte *label, int leaf, int selected);
+extern void ui_tree_pop();
+extern void ui_next_open();
+extern void ui_scroll_here();
+extern void ui_drag_source(readonly byte *type, int value, readonly byte *label);
+extern int ui_drag_target(readonly byte *type, int *value);
+extern int ui_context_begin();
+extern int ui_menu_item(readonly byte *label, int enabled);
+
+struct HierarchyPanel
+{
+    public int[] First;
+    public int[] Last;
+    public int[] Next;
+    public bool[] Reveal;
+    public int Selection;
+    public int Parent;
+    public int Root;
+    public bool RevealSelection;
+
+    public HierarchyPanel()
+    {
+        First = new int[Capacity];
+        Last = new int[Capacity];
+        Next = new int[Capacity];
+        Reveal = new bool[Capacity];
+        Selection = -1;
+        Parent = -1;
+    }
+
+    public ~HierarchyPanel()
+    {
+        delete (First);
+        delete (Last);
+        delete (Next);
+        delete (Reveal);
+    }
+
+    public void Build(float *state, float *records)
+    {
+        int selected = cast<int>(state[3]);
+        int parent = -1;
+        if (selected >= 0 && selected < Capacity)
+        {
+            parent = cast<int>(records[selected * Stride + 14]);
+        }
+        RevealSelection = Selection != selected || Parent != parent;
+        Selection = selected;
+        Parent = parent;
+        Root = -1;
+        int lastRoot = -1;
+        for (int i = 0; i < Capacity; i++)
+        {
+            First[i] = -1;
+            Last[i] = -1;
+            Next[i] = -1;
+            Reveal[i] = false;
+        }
+        int ancestor = Selection;
+        for (int depth = 0; depth < 64 && ancestor >= 0 && ancestor < Capacity; depth++)
+        {
+            ancestor = cast<int>(records[ancestor * Stride + 14]) - 1;
+            if (ancestor >= 0 && ancestor < Capacity)
+            {
+                Reveal[ancestor] = true;
+            }
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (records[i * Stride] == 0.0f)
+            {
+                continue;
+            }
+            int owner = cast<int>(records[i * Stride + 14]) - 1;
+            if (owner >= 0 && owner < Capacity)
+            {
+                if (First[owner] < 0)
+                {
+                    First[owner] = i;
+                }
+                else
+                {
+                    Next[Last[owner]] = i;
+                }
+                Last[owner] = i;
+            }
+            else
+            {
+                if (Root < 0)
+                {
+                    Root = i;
+                }
+                else
+                {
+                    Next[lastRoot] = i;
+                }
+                lastRoot = i;
+            }
+        }
+    }
+
+    public void Node(int slot, float *state, float *records, int depth)
+    {
+        if (depth >= 64)
+        {
+            return;
+        }
+        ui_push_id(slot);
+        int kind = cast<int>(records[slot * Stride]);
+        if (RevealSelection && Reveal[slot])
+        {
+            ui_next_open();
+        }
+        String name = ObjectLabel(kind, slot);
+        String label = name + String("  [") + LayerName(cast<int>(records[slot * Stride + 15])) + String("]");
+        bool open = ui_tree("object", label.CString, UiFlag(First[slot] < 0), UiFlag(Selection == slot)) != 0;
+        if (RevealSelection && Selection == slot && ui_item_query(6) == 0)
+        {
+            ui_scroll_here();
+        }
+        if (ui_item_query(4) != 0 && ui_item_query(5) == 0)
+        {
+            ed_row_view(slot);
+            QueueEditorCommand(70);
+        }
+        bool editable = EditableObjectTree(records, slot);
+        if (editable)
+        {
+            ui_drag_source("OXYGEN_OBJECT", slot, name.CString);
+        }
+        int source = -1;
+        if (ui_drag_target("OXYGEN_OBJECT", &source) != 0)
+        {
+            ed_parent_view(source, slot);
+            QueueEditorCommand(92);
+        }
+        if (ui_context_begin() != 0)
+        {
+            if (ui_menu_item("Select", 1) != 0)
+            {
+                ed_row_view(slot);
+                QueueEditorCommand(70);
+            }
+            if (ui_menu_item("Detach from parent", UiFlag(records[slot * Stride + 14] != 0.0f && editable)) !=
+                0)
+            {
+                ed_parent_view(slot, -1);
+                QueueEditorCommand(92);
+            }
+            ui_popup_end();
+        }
+        if (open)
+        {
+            for (int child = First[slot]; child >= 0; child = Next[child])
+            {
+                Node(child, state, records, depth + 1);
+            }
+            ui_tree_pop();
+        }
+        ui_pop_id();
+    }
+
+    public void Draw(float *state, float *records)
+    {
+        ui_disabled_begin(UiFlag(state[6] != 0.0f));
+        StringBuilder count = StringBuilder();
+        count.Append(cast<int>(state[4]));
+        count.Append(" objects");
+        ui_text_disabled(count.ToString().CString);
+        ui_selectable("Scene root (drop to detach)", 0);
+        int source = -1;
+        if (ui_drag_target("OXYGEN_OBJECT", &source) != 0)
+        {
+            ed_parent_view(source, -1);
+            QueueEditorCommand(92);
+        }
+        ui_separator();
+        Build(state, records);
+        for (int slot = Root; slot >= 0; slot = Next[slot])
+        {
+            Node(slot, state, records, 0);
+        }
+        ui_disabled_end();
+    }
+}
+
+static struct HierarchyService
+{
+    public static HierarchyPanel *Panel;
+}

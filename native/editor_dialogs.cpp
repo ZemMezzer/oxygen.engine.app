@@ -2,10 +2,17 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+
 #include <commdlg.h>
 #include <shlobj.h>
 #include <string>
 
+using EditorMenuPolicy = int (*)(int, int, int, int, int);
+static EditorMenuPolicy menuPolicy = nullptr;
+extern "C" __declspec(dllexport) void ed_bind_menu_policy(EditorMenuPolicy callback)
+{
+    menuPolicy = callback;
+}
 namespace
 {
 HWND owner = nullptr;
@@ -48,6 +55,7 @@ int output(const wchar_t *path, char *out, int size)
 } // namespace
 extern "C" void ed_native_init()
 {
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 }
 extern "C" void ed_native_close()
@@ -155,6 +163,7 @@ extern "C" void ed_native_menu(void *window)
     item(windows, L"Inspector", 202);
     item(windows, L"Resources", 203);
     item(windows, L"Tiles", 204);
+    item(windows, L"Layers", 205);
     AppendMenuW(windows, MF_SEPARATOR, 0, nullptr);
     item(windows, L"Reset Layout", 210);
     section(L"&Window", windows);
@@ -170,17 +179,10 @@ extern "C" int ed_native_command()
 }
 extern "C" void ed_native_menu_state(int play, int selected, int undo, int redo)
 {
-    auto enable = [](int action, bool enabled) {
-        EnableMenuItem(menuBar, 1000 + action, MF_BYCOMMAND | (enabled ? MF_ENABLED : MF_GRAYED));
-    };
-    for (int action : {1, 2, 3, 4, 5, 9, 10, 13})
+    for (int action : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 13, 50, 64, 91, 99, 200, 201, 202, 203, 204, 205, 210})
     {
-        enable(action, !play);
-    }
-    enable(7, !play && undo);
-    enable(8, !play && redo);
-    for (int action : {50, 64, 91})
-    {
-        enable(action, !play && selected);
+        EnableMenuItem(menuBar, 1000 + action,
+                       MF_BYCOMMAND |
+                           (menuPolicy(action, play, selected, undo, redo) ? MF_ENABLED : MF_GRAYED));
     }
 }

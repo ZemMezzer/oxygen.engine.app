@@ -1,0 +1,112 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int RoundedFootprintChecks()
+{
+    int failures = 0;
+    int asset = ed_asset_find("Tiles/tile_Regression/grid-fractional.oxtile");
+    if (asset == 0)
+    {
+        Log("FAIL: fractional tile fixture missing.");
+        return 1;
+    }
+    for (int turn = 0; turn < 4; turn++)
+    {
+        Document doc = Document();
+        Vector3 origin = Vector3(-5.0f, -4.0f, 1.0f);
+        float yaw = cast<float>(turn) * 90.0f;
+        int slot = doc.Add(6, origin, yaw, asset, 0);
+        if (slot < 0)
+        {
+            failures++;
+            continue;
+        }
+        Primitive value = MakePrimitive(&doc.Data[0], slot);
+        Primitive preview = TilePlacement(asset, origin, yaw);
+        Bounds geometry = TileBounds(value);
+        Bounds reserved = TileFootprint(value);
+        Bounds cells = TileCells(value);
+        Vector3 size = Subtract(reserved.High, reserved.Low);
+        float width = 6.0f;
+        float depth = 4.0f;
+        if (turn % 2 != 0)
+        {
+            width = 4.0f;
+            depth = 6.0f;
+        }
+        if (value.Size.X != 5.25f || value.Size.Y != 4.0f || value.Size.Z != 4.0f ||
+            Abs(size.X - width) > 0.001f || Abs(size.Z - depth) > 0.001f || !GridAligned(reserved.Low.X) ||
+            !GridAligned(reserved.High.X) || !GridAligned(reserved.Low.Z) || !GridAligned(reserved.High.Z) ||
+            cells.High.X - cells.Low.X != width * 0.5f ||
+            Length(Subtract(value.Transform.Position, preview.Transform.Position)) > 0.001f)
+        {
+            failures++;
+        }
+        // The first wall was authored on grid lines; it must remain on grid after placement.
+        // Padding is directional and rotates around the authored origin with the mesh.
+        // Check actual centered mesh vertices independently of the snapping helper.
+        Vector3 anchor = TileAuthoredOrigin(value, asset);
+        Vector3 cornerA =
+            Add(value.Transform.Position, Rotate(value.Transform.Rotation, Vector3(-2.625f, -2.0f, 2.0f)));
+        Vector3 cornerB =
+            Add(value.Transform.Position, Rotate(value.Transform.Rotation, Vector3(1.375f, 2.0f, 2.0f)));
+        Vector3 offsetCorner =
+            Add(value.Transform.Position, Rotate(value.Transform.Rotation, Vector3(-1.375f, -2.0f, -2.0f)));
+        Vector3 expectedOffset = Rotate(value.Transform.Rotation, Vector3(1.25f, 0.0f, -4.0f));
+        if (!GridAligned(anchor.X) || !GridAligned(anchor.Y) || !GridAligned(anchor.Z) ||
+            !GridAligned(cornerA.X) || !GridAligned(cornerA.Y) || !GridAligned(cornerA.Z) ||
+            !GridAligned(cornerB.X) || !GridAligned(cornerB.Y) || !GridAligned(cornerB.Z) ||
+            Length(Subtract(Subtract(offsetCorner, cornerA), expectedOffset)) > 0.001f ||
+            geometry.Low.X < reserved.Low.X - 0.001f || geometry.High.X > reserved.High.X + 0.001f)
+        {
+            failures++;
+        }
+        Vector3 neighbour = Vector3(value.Transform.Position.X + width, doc.Data[slot * Stride + 2],
+                                    value.Transform.Position.Z);
+        int next = doc.Add(6, neighbour, yaw, asset, 0);
+        if (next < 0)
+        {
+            failures++;
+        }
+        else
+        {
+            Bounds nextReserved = TileFootprint(MakePrimitive(&doc.Data[0], next));
+            if (Abs(nextReserved.Low.X - reserved.High.X) > 0.001f)
+            {
+                failures++;
+            }
+        }
+        neighbour.X -= 2.0f;
+        if (doc.Add(6, neighbour, yaw, asset, 0) >= 0)
+        {
+            failures++;
+        }
+        doc.ResetHistory();
+        doc.Data[slot * Stride + 6] = 5.25f;
+        SnapWorldTile(&doc.Data[0], slot);
+        value = MakePrimitive(&doc.Data[0], slot);
+        reserved = TileFootprint(value);
+        geometry = TileBounds(value);
+        if (value.Size.Y != 5.25f || Abs(reserved.High.Y - reserved.Low.Y - 6.0f) > 0.001f ||
+            Abs(geometry.Low.Y - reserved.Low.Y) > 0.001f)
+        {
+            failures++;
+        }
+        doc.Commit();
+        doc.Restore(0);
+        if (doc.Data[slot * Stride + 6] != 4.0f)
+        {
+            failures++;
+        }
+    }
+    if (failures == 0)
+    {
+        Log("PASS: 5.25m mesh reserves 6m without stretching; authored grid, rotated Faces, neighbours, occupancy and Undo.");
+    }
+    else
+    {
+        Log("FAIL: rounded tile footprint.");
+    }
+    return failures;
+}

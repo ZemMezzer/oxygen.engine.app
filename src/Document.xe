@@ -3,7 +3,7 @@ using Oxygen;
 namespace OxygenEditor;
 
 const int Capacity = 4096;
-const int Stride = 15;
+const int Stride = 16;
 const int RecordSize = Capacity * Stride;
 const int HistorySize = 32;
 
@@ -11,8 +11,10 @@ const int HistorySize = 32;
 // pitch, roll.
 struct Document
 {
+    public int ActiveLayer;
     public float[] Data;
     public float[] History;
+    public int[] HistoryLayers;
     public int HistoryStart;
     public int HistoryCount;
     public int Cursor;
@@ -22,16 +24,28 @@ struct Document
     {
         Data = new float[RecordSize];
         History = new float[RecordSize * HistorySize];
+        HistoryLayers = new int[HistorySize];
     }
 
     public ~Document()
     {
+        for (int i = 0; i < HistorySize; i++)
+        {
+            ed_layers_release(HistoryLayers[i]);
+        }
+        delete (HistoryLayers);
         delete (History);
         delete (Data);
     }
 
     public void ResetHistory()
     {
+        for (int i = 0; i < HistorySize; i++)
+        {
+            ed_layers_release(HistoryLayers[i]);
+            HistoryLayers[i] = 0;
+        }
+        HistoryLayers[0] = ed_layers_snapshot(ActiveLayer);
         HistoryStart = 0;
         HistoryCount = 1;
         Cursor = 0;
@@ -59,6 +73,9 @@ struct Document
             History[start + i] = Data[i];
         }
 
+        int layerSlot = start / RecordSize;
+        ed_layers_release(HistoryLayers[layerSlot]);
+        HistoryLayers[layerSlot] = ed_layers_snapshot(ActiveLayer);
         HistoryCount++;
         Cursor = HistoryCount - 1;
         Dirty = true;
@@ -79,7 +96,119 @@ struct Document
             Data[i] = History[start + i];
         }
 
+        int active = ed_layers_restore(HistoryLayers[start / RecordSize]);
+        if (active >= 0)
+        {
+            ActiveLayer = active;
+        }
         Dirty = true;
+    }
+
+    public bool RemoveLayer(int source, int target)
+    {
+        int count = ed_layer_count();
+        if (ed_layer_editable(source) == 0 || (target >= 0 && ed_layer_editable(target) == 0))
+        {
+            ed_status("Show and unlock the source and destination layers first.");
+            return false;
+        }
+        // Removing a parent on this layer must not reparent a protected child elsewhere.
+        if (target < 0)
+        {
+            for (int i = 0; i < Capacity; i++)
+            {
+                if (Data[i * Stride] != 0.0f && !CanEdit(i))
+                {
+                    int parent = Parent(i);
+                    if (parent >= 0 && cast<int>(Data[parent * Stride + 15]) == source)
+                    {
+                        ed_status("Unlock child layers before deleting their parent layer.");
+                        return false;
+                    }
+                }
+            }
+        }
+        if (count <= 1 || source < 0 || source >= count || target < -1 || target >= count || target == source)
+        {
+            return false;
+        }
+        float[] before = new float[RecordSize];
+        for (int i = 0; i < RecordSize; i++)
+        {
+            before[i] = Data[i];
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            if (Data[at] == 0.0f)
+            {
+                continue;
+            }
+            int layer = cast<int>(Data[at + 15]);
+            if (layer == source)
+            {
+                if (target < 0)
+                {
+                    Data[at] = 0.0f;
+                    continue;
+                }
+                layer = target;
+            }
+            if (layer > source)
+            {
+                layer--;
+            }
+            Data[at + 15] = cast<float>(layer);
+        }
+        bool valid = true;
+        for (int i = 0; i < Capacity; i++)
+        {
+            int at = i * Stride;
+            if (Data[at] == 0.0f)
+            {
+                continue;
+            }
+            // Children on other layers retain their world pose and nearest surviving ancestor.
+            int parent = cast<int>(before[at + 14]) - 1;
+            while (parent >= 0 && Data[parent * Stride] == 0.0f)
+            {
+                parent = cast<int>(before[parent * Stride + 14]) - 1;
+            }
+            Data[at + 14] = cast<float>(parent + 1);
+            if (target >= 0 && cast<int>(before[at + 15]) == source && IsWorldTile(&Data[0], i) &&
+                !TileSpaceFree(&Data[0], TileCells(MakePrimitive(&Data[0], i)), cast<int>(Data[at + 15]), i))
+            {
+                valid = false;
+            }
+        }
+        if (!valid || ed_layer_remove(source) == 0)
+        {
+            for (int i = 0; i < RecordSize; i++)
+            {
+                Data[i] = before[i];
+            }
+            delete (before);
+            ed_status("Layer kept: destination cells are occupied or the layer cannot be removed.");
+            return false;
+        }
+        if (ActiveLayer == source)
+        {
+            ActiveLayer = target;
+            if (target < 0)
+            {
+                ActiveLayer = 0;
+                if (source == 0)
+                {
+                    ActiveLayer = 1;
+                }
+            }
+        }
+        if (ActiveLayer > source)
+        {
+            ActiveLayer--;
+        }
+        delete (before);
+        return true;
     }
 
     public int Count()
@@ -103,6 +232,19 @@ struct Document
         {
             int at = i * Stride;
             int kind = cast<int>(Data[at]);
+            if (cast<int>(Data[at + 15]) != ActiveLayer)
+            {
+                continue;
+            }
+            if (brush == 10 && IsWorldTile(&Data[0], i))
+            {
+                Bounds cells = TileCells(MakePrimitive(&Data[0], i));
+                if (x >= cells.Low.X * 2.0f && x < cells.High.X * 2.0f && y >= cells.Low.Y * 2.0f &&
+                    y < cells.High.Y * 2.0f && z >= cells.Low.Z * 2.0f && z < cells.High.Z * 2.0f)
+                {
+                    return i;
+                }
+            }
             if (brush == 1 && kind != 1)
             {
                 continue;
@@ -130,6 +272,10 @@ struct Document
 
     public int Add(int kind, Vector3 origin, float yaw, int asset, int palette)
     {
+        if (ed_layer_editable(ActiveLayer) == 0)
+        {
+            return -1;
+        }
         int slot = -1;
 
         for (int i = 0; i < Capacity; i++)
@@ -163,6 +309,7 @@ struct Document
         Data[at + 12] = 0.0f;
         Data[at + 13] = 0.0f;
         Data[at + 14] = 0.0f;
+        Data[at + 15] = cast<float>(ActiveLayer);
 
         if (kind == 1)
         {
@@ -187,6 +334,10 @@ struct Document
             Bounds bounds = ModelBounds(model);
             Vector3 size = Subtract(bounds.High, bounds.Low);
             float scale = 2.0f / Max(0.02f, Max(size.X, Max(size.Y, size.Z)));
+            if (ed_asset_kind(asset) == 5)
+            {
+                scale = 1.0f;
+            }
             Data[at + 5] = Max(0.02f, size.X * scale);
             Data[at + 6] = Max(0.02f, size.Y * scale);
             Data[at + 7] = Max(0.02f, size.Z * scale);
@@ -209,6 +360,16 @@ struct Document
             }
         }
 
+        if (IsWorldTile(&Data[0], slot))
+        {
+            SnapWorldTile(&Data[0], slot);
+            if (!TileSpaceFree(&Data[0], TileCells(MakePrimitive(&Data[0], slot)), ActiveLayer, slot))
+            {
+                Data[at] = 0.0f;
+                ed_status("Tile cells are occupied in this layer.");
+                return -1;
+            }
+        }
         return slot;
     }
 
@@ -231,8 +392,34 @@ struct Document
         return false;
     }
 
+    public bool CanEdit(int slot)
+    {
+        return slot >= 0 && slot < Capacity && Data[slot * Stride] != 0.0f &&
+               ed_layer_editable(cast<int>(Data[slot * Stride + 15])) != 0;
+    }
+
+    public bool CanEditTree(int slot)
+    {
+        if (!CanEdit(slot))
+        {
+            return false;
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (Data[i * Stride] != 0.0f && !CanEdit(i) && Descendant(i, slot))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public bool Reparent(int slot, int parent)
     {
+        if (!CanEditTree(slot) || (parent >= 0 && !CanEdit(parent)))
+        {
+            return false;
+        }
         if (slot < 0 || slot >= Capacity || Data[slot * Stride] == 0.0f || parent < -1 ||
             parent >= Capacity || parent == slot ||
             (parent >= 0 && (Data[parent * Stride] == 0.0f || Descendant(parent, slot))))
@@ -277,6 +464,10 @@ struct Document
 
     public void Remove(int slot)
     {
+        if (!CanEditTree(slot))
+        {
+            return;
+        }
         int[] affected = new int[Capacity];
         for (int i = 0; i < Capacity; i++)
         {
@@ -298,6 +489,10 @@ struct Document
 
     public int Duplicate(int slot)
     {
+        if (!CanEditTree(slot))
+        {
+            return -1;
+        }
         if (slot < 0 || Data[slot * Stride] == 0.0f)
         {
             return -1;
@@ -350,6 +545,64 @@ struct Document
                 Data[at + 14] = cast<float>(copies[parent] + 1);
             }
         }
+        bool tiles = false;
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (copies[i] >= 0 && IsWorldTile(&Data[0], i))
+            {
+                tiles = true;
+            }
+        }
+        if (tiles)
+        {
+            bool placed = false;
+            for (int attempt = 0; attempt < 96 && !placed; attempt++)
+            {
+                int axis = (attempt % 6) / 2;
+                float offset = cast<float>(attempt / 6 + 1) * 2.0f;
+                if (attempt % 2 == 1)
+                {
+                    offset = -offset;
+                }
+                for (int i = 0; i < Capacity; i++)
+                {
+                    if (copies[i] < 0)
+                    {
+                        continue;
+                    }
+                    for (int a = 0; a < 3; a++)
+                    {
+                        Data[copies[i] * Stride + 1 + a] = Data[i * Stride + 1 + a];
+                    }
+                    Data[copies[i] * Stride + 1 + axis] += offset;
+                    SnapWorldTile(&Data[0], copies[i]);
+                }
+                placed = true;
+                for (int i = 0; i < Capacity; i++)
+                {
+                    if (copies[i] >= 0 && IsWorldTile(&Data[0], copies[i]) &&
+                        !TileSpaceFree(&Data[0], TileCells(MakePrimitive(&Data[0], copies[i])),
+                                       cast<int>(Data[copies[i] * Stride + 15]), copies[i]))
+                    {
+                        placed = false;
+                    }
+                }
+            }
+            if (!placed)
+            {
+                for (int i = 0; i < Capacity; i++)
+                {
+                    if (copies[i] >= 0)
+                    {
+                        Data[copies[i] * Stride] = 0.0f;
+                    }
+                }
+                delete (copies);
+                delete (vacancies);
+                ed_status("No free grid cells for this tile group.");
+                return -1;
+            }
+        }
         int result = copies[slot];
         delete (copies);
         delete (vacancies);
@@ -358,6 +611,14 @@ struct Document
 
     public void FollowTransform(float *before, int root)
     {
+        if (!CanEditTree(root))
+        {
+            for (int i = 0; i < RecordSize; i++)
+            {
+                Data[i] = before[i];
+            }
+            return;
+        }
         if (root < 0)
         {
             return;

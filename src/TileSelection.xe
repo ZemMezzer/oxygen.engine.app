@@ -1,0 +1,176 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+struct TileRectangleSelection
+{
+    public bool Active;
+    public bool Additive;
+    public bool Dragged;
+    public bool Faces;
+    public int PreviousFace;
+    public float StartX;
+    public float StartY;
+    public float[] Before;
+
+    public TileRectangleSelection()
+    {
+        Before = new float[TileVertices];
+    }
+
+    public ~TileRectangleSelection()
+    {
+        delete (Before);
+    }
+
+    public void Begin(float *selection, float *input)
+    {
+        Active = true;
+        Dragged = false;
+        StartX = input[0];
+        StartY = input[1];
+        Additive = input[2] != 0.0f;
+        Faces = input[3] != 0.0f;
+        PreviousFace = cast<int>(input[4]);
+        for (int i = 0; i < TileVertices; i++)
+        {
+            Before[i] = selection[i];
+        }
+    }
+
+    public int Update(float *data, float *selection, float *camera, float *input)
+    {
+        int face = cast<int>(input[7]);
+        if (!Active)
+        {
+            return face;
+        }
+        if (input[6] != 0.0f)
+        {
+            for (int i = 0; i < TileVertices; i++)
+            {
+                selection[i] = Before[i];
+            }
+            Active = false;
+            if (Faces)
+            {
+                face = PreviousFace;
+            }
+            return face;
+        }
+        float x = Clamp(input[0], 0.0f, input[2]);
+        float y = Clamp(input[1], 0.0f, input[3]);
+        float left = Min(StartX, x);
+        float right = Max(StartX, x);
+        float top = Min(StartY, y);
+        float bottom = Max(StartY, y);
+        Vector3 position = Vector3(camera[0], camera[1], camera[2]);
+        Vector3 forward = Normalize(Subtract(Vector3(camera[3], camera[4], camera[5]), position));
+        Dragged = Dragged || input[4] != 0.0f;
+        int[] inside = int[TileVertices];
+        float[] projected = float[2];
+        for (int i = 0; i < TileVertices; i++)
+        {
+            selection[i] = 0.0f;
+            if (Additive)
+            {
+                selection[i] = Before[i];
+            }
+            if (data[i * 4] == 0.0f)
+            {
+                continue;
+            }
+            Vector3 point = Vector3(data[i * 4 + 1], data[i * 4 + 2], data[i * 4 + 3]);
+            if (Dot(Subtract(point, position), forward) <= 0.01f)
+            {
+                continue;
+            }
+            ed_project_point(camera, point.X, point.Y, point.Z, cast<int>(input[2]), cast<int>(input[3]),
+                             &projected[0]);
+            if (projected[0] >= left && projected[0] <= right && projected[1] >= top &&
+                projected[1] <= bottom)
+            {
+                inside[i] = 1;
+            }
+        }
+        if (Faces)
+        {
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int at = TileFaceStart + i * TileFaceStride;
+                if (!Dragged || data[at] == 0.0f)
+                {
+                    continue;
+                }
+                bool contained = true;
+                for (int j = 1; j <= 4; j++)
+                {
+                    if (inside[cast<int>(data[at + j])] == 0)
+                    {
+                        contained = false;
+                    }
+                }
+                if (contained)
+                {
+                    for (int j = 1; j <= 4; j++)
+                    {
+                        selection[cast<int>(data[at + j])] = 1.0f;
+                    }
+                }
+            }
+            face = -1;
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int at = TileFaceStart + i * TileFaceStride;
+                if (data[at] != 0.0f && selection[cast<int>(data[at + 1])] != 0.0f &&
+                    selection[cast<int>(data[at + 2])] != 0.0f &&
+                    selection[cast<int>(data[at + 3])] != 0.0f && selection[cast<int>(data[at + 4])] != 0.0f)
+                {
+                    face = i;
+                    break;
+                }
+            }
+        }
+        else if (Dragged)
+        {
+            for (int i = 0; i < TileVertices; i++)
+            {
+                if (inside[i] != 0)
+                {
+                    selection[i] = 1.0f;
+                }
+            }
+        }
+        if (input[5] != 0.0f)
+        {
+            Active = false;
+        }
+        return face;
+    }
+}
+
+static struct SelectionService
+{
+    public static TileRectangleSelection *Rectangle;
+}
+
+extern void ed_project_point(float *camera, float x, float y, float z, int width, int height, float *screen);
+extern void ed_bind_tile_selection(function int(int, float *, float *, float *, float *) * callback);
+
+int TileSelectionDispatch(int operation, float *data, float *selection, float *camera, float *input)
+{
+    if (operation == 0)
+    {
+        SelectionService.Rectangle->Begin(selection, input);
+        return 1;
+    }
+    if (operation == 1)
+    {
+        return SelectionService.Rectangle->Update(data, selection, camera, input);
+    }
+    if (SelectionService.Rectangle->Active)
+    {
+        return 1;
+    }
+    return 0;
+}

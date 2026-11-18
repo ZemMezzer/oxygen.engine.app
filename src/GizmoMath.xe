@@ -1,0 +1,96 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+extern float atan2f(float y, float x);
+extern float tanf(float value);
+extern float expf(float value);
+extern float roundf(float value);
+extern void ed_screen_ray(float *camera, float x, float y, int width, int height, float *ray);
+
+struct ScreenPoint
+{
+    public float X;
+    public float Y;
+
+    public ScreenPoint(float x, float y)
+    {
+        X = x;
+        Y = y;
+    }
+}
+
+Vector3
+GizmoAxis(int index)
+{
+    if (index == 0)
+    {
+        return Vector3(1.0f, 0.0f, 0.0f);
+    }
+    if (index == 1)
+    {
+        return Vector3(0.0f, 1.0f, 0.0f);
+    }
+    return Vector3(0.0f, 0.0f, 1.0f);
+}
+
+ScreenPoint ProjectGizmo(float *camera, Vector3 position)
+{
+    float[] point = float[2];
+    ed_project_point(camera, position.X, position.Y, position.Z, cast<int>(camera[12]), cast<int>(camera[13]),
+                     &point[0]);
+    return ScreenPoint(point[0] + camera[10], point[1] + camera[11]);
+}
+
+bool GizmoPlaneHit(float *ray, Vector3 origin, Vector3 normal, Vector3 *hit)
+{
+    Vector3 position = Vector3(ray[0], ray[1], ray[2]);
+    Vector3 direction = Vector3(ray[3], ray[4], ray[5]);
+    float denominator = Dot(direction, normal);
+    if (Abs(denominator) < 0.0001f)
+    {
+        return false;
+    }
+    float t = Dot(Subtract(origin, position), normal) / denominator;
+    if (t != t || t < 0.0f || t > 100000.0f)
+    {
+        return false;
+    }
+    *hit = Add(position, Scale(direction, t));
+    return true;
+}
+
+float ScreenDistance(ScreenPoint a, ScreenPoint b)
+{
+    float x = a.X - b.X;
+    float y = a.Y - b.Y;
+    return ox_sqrt(x * x + y * y);
+}
+
+float SegmentDistance(ScreenPoint point, ScreenPoint a, ScreenPoint b)
+{
+    float x = b.X - a.X;
+    float y = b.Y - a.Y;
+    float length = x * x + y * y;
+    if (length < 0.001f)
+    {
+        return ScreenDistance(point, a);
+    }
+    float t = Clamp(((point.X - a.X) * x + (point.Y - a.Y) * y) / length, 0.0f, 1.0f);
+    return ScreenDistance(point, ScreenPoint(a.X + x * t, a.Y + y * t));
+}
+
+Vector3 GizmoRing(Vector3 pivot, int axis, float angle, float radius)
+{
+    return Add(pivot, Add(Scale(GizmoAxis((axis + 1) % 3), Cos(angle) * radius),
+                          Scale(GizmoAxis((axis + 2) % 3), Sin(angle) * radius)));
+}
+
+float GizmoSnap(float value, float step, bool snap)
+{
+    if (snap)
+    {
+        return roundf(value / step) * step;
+    }
+    return value;
+}

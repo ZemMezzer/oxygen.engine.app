@@ -1,0 +1,93 @@
+using Xenon.Text;
+using Xenon.IO;
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+// Narrow OS bindings: no project, scene or asset policy lives in these functions.
+extern int ed_fs_list(readonly byte *directory, int recursive, function void(readonly byte *, int) * visitor);
+extern int ed_fs_path(int operation, readonly byte *path, readonly byte *basePath, byte *output,
+                      int capacity);
+extern int ed_fs_create_directories(readonly byte *path);
+extern int ed_fs_copy(readonly byte *source, readonly byte *destination);
+extern int ed_fs_symlink(readonly byte *path);
+extern readonly byte *ed_project_root();
+
+String JoinPath(readonly String &left, readonly String &right)
+{
+    return Path.Combine(left.AsView(), right.AsView());
+}
+
+String NativePath(int operation, readonly String &path, readonly String &basePath)
+{
+    unique<byte[]> buffer = new byte[32768];
+    if (ed_fs_path(operation, path.CString, basePath.CString, &buffer[0], 32768) == 0)
+    {
+        throw 1;
+    }
+    return String(&buffer[0]);
+}
+
+String AssetRoot()
+{
+    return JoinPath(String(ed_project_root()), String("Assets"));
+}
+
+String AssetFile(readonly String &relative)
+{
+    return JoinPath(AssetRoot(), relative);
+}
+
+struct FileEntry
+{
+    public String Path;
+    public int Kind;
+
+    public FileEntry(String path, int kind)
+    {
+        Path = path;
+        Kind = kind;
+    }
+}
+
+static struct FileEnumeration
+{
+    public static Vector<FileEntry> *Entries;
+}
+
+Vector<FileEntry>
+ListFiles(readonly String &directory, bool recursive)
+{
+    Vector<FileEntry> *result = new Vector<FileEntry>();
+    Vector<FileEntry> *previous = FileEnumeration.Entries;
+    FileEnumeration.Entries = result;
+    int recurse = 0;
+    if (recursive)
+    {
+        recurse = 1;
+    }
+    int ok = ed_fs_list(
+        directory.CString, recurse, function void(readonly byte * path, int kind) {
+            FileEnumeration.Entries->Add(FileEntry(String(path), kind));
+        });
+    FileEnumeration.Entries = previous;
+    if (ok == 0)
+    {
+        delete (result);
+        throw 1;
+    }
+    Vector<FileEntry> entries = move * result;
+    free(result);
+    return move entries;
+}
+
+bool TileAssetPath(readonly String &relative)
+{
+    if (!SafeAssetPath(relative) || !String(Path.GetExtension(relative.AsView())).Equals(String(".oxtile")))
+    {
+        return false;
+    }
+    String basePath = NativePath(3, AssetRoot(), String());
+    String absolute = NativePath(3, JoinPath(basePath, relative), String());
+    return SafeAssetPath(NativePath(2, absolute, basePath));
+}

@@ -1,0 +1,340 @@
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+extern void ui_section(readonly byte *label);
+extern void ui_text_disabled(readonly byte *label);
+extern void ui_item_width(float width);
+extern void ui_input_float(readonly byte *label, float *value);
+extern int ui_item_query(int query);
+extern void ed_parent_view(int source, int target);
+extern void ed_bind_inspector(function int(int, float *, float *, float *) * callback);
+
+readonly byte *ObjectName(int kind)
+{
+    if (kind == 1)
+    {
+        return "Floor";
+    }
+    if (kind == 2)
+    {
+        return "Block";
+    }
+    if (kind == 3)
+    {
+        return "Wall";
+    }
+    if (kind == 4)
+    {
+        return "Ramp";
+    }
+    if (kind == 5)
+    {
+        return "Column";
+    }
+    if (kind == 6)
+    {
+        return "Model";
+    }
+    if (kind == 7)
+    {
+        return "Point light";
+    }
+    if (kind == 8)
+    {
+        return "Sound";
+    }
+    if (kind == 9)
+    {
+        return "Player start";
+    }
+    return "Empty";
+}
+
+String ObjectLabel(int kind, int slot)
+{
+    StringBuilder text = StringBuilder();
+    text.Append(ObjectName(kind));
+    text.Append("  #");
+    text.Append(slot + 1);
+    return text.ToString();
+}
+
+bool UiFullButton(readonly byte *text)
+{
+    return ui_button(text, -1.0f, 0.0f) != 0;
+}
+
+struct InspectorPanel
+{
+    public float[] Numeric;
+    public float[] Before;
+    public float[] Pending;
+    public bool Editing;
+    public bool Dirty;
+    public int Selection;
+
+    public InspectorPanel()
+    {
+        Numeric = new float[9];
+        Before = new float[9];
+        Pending = new float[9];
+        Selection = -1;
+    }
+
+    public ~InspectorPanel()
+    {
+        delete (Numeric);
+        delete (Before);
+        delete (Pending);
+    }
+
+    public void Commit(bool first)
+    {
+        if (!Dirty)
+        {
+            return;
+        }
+        for (int i = 0; i < 9; i++)
+        {
+            Pending[i] = Numeric[i];
+        }
+        if (first)
+        {
+            WorkspaceService.Commands->Insert(0, 90);
+        }
+        else
+        {
+            QueueEditorCommand(90);
+        }
+        Dirty = false;
+    }
+
+    public void Draw(float *state, float *records)
+    {
+        bool wasEditing = Editing;
+        Editing = false;
+        int selected = cast<int>(state[3]);
+        if (selected < 0)
+        {
+            ui_text_wrapped("Select an object in Scene or Hierarchy to edit its properties.");
+            return;
+        }
+        float *record = records + selected * Stride;
+        ui_text(ObjectLabel(cast<int>(record[0]), selected).CString);
+        ui_section("Transform / world");
+        if (selected != Selection || !wasEditing)
+        {
+            Selection = selected;
+            for (int i = 0; i < 3; i++)
+            {
+                Numeric[i] = record[1 + i];
+                Numeric[6 + i] = record[5 + i];
+            }
+            Numeric[3] = record[12];
+            Numeric[4] = record[4];
+            Numeric[5] = record[13];
+            Dirty = false;
+        }
+        bool editable = EditableObjectTree(records, selected);
+        if (!editable)
+        {
+            ui_text_disabled("Read only: hidden or locked layer in this object tree.");
+        }
+        ui_disabled_begin(UiFlag(state[6] != 0.0f || !editable));
+        bool commit = false;
+        for (int group = 0; group < 3; group++)
+        {
+            readonly byte *label = "Position";
+            if (group == 1)
+            {
+                label = "Rotation (degrees)";
+            }
+            if (group == 2)
+            {
+                label = "Size (metres)";
+            }
+            ui_text(label);
+            if (ui_table_begin(label, 3, 1) != 0)
+            {
+                ui_table_next();
+                ui_text_disabled("X");
+                ui_table_next();
+                ui_text_disabled("Y");
+                ui_table_next();
+                ui_text_disabled("Z");
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    ui_table_next();
+                    ui_push_id(group * 3 + axis);
+                    ui_item_width(-1.0f);
+                    ui_input_float("##value", &Numeric[group * 3 + axis]);
+                    if (ui_item_query(0) != 0)
+                    {
+                        for (int i = 0; i < 9; i++)
+                        {
+                            Before[i] = Numeric[i];
+                        }
+                    }
+                    if (ui_item_query(1) != 0)
+                    {
+                        Dirty = true;
+                    }
+                    bool active = ui_item_query(2) != 0;
+                    Editing = Editing || active;
+                    if (active && UiKey(256))
+                    {
+                        for (int i = 0; i < 9; i++)
+                        {
+                            Numeric[i] = Before[i];
+                        }
+                        Dirty = false;
+                    }
+                    if (Dirty && (ui_item_query(3) != 0 || (active && UiKey(257))))
+                    {
+                        commit = true;
+                    }
+                    ui_pop_id();
+                }
+                ui_table_end();
+            }
+        }
+        if (commit)
+        {
+            Commit(true);
+        }
+        ui_text_disabled("Enter / leave field: apply. Esc: cancel.");
+        ui_section("Hierarchy");
+        int parent = cast<int>(record[14]) - 1;
+        if (parent < 0)
+        {
+            ui_text_disabled("Parent: Scene root");
+        }
+        else
+        {
+            ui_text((String("Parent: ") + ObjectLabel(cast<int>(records[parent * Stride]), parent)).CString);
+            if (UiButton("Detach from parent"))
+            {
+                ed_parent_view(selected, -1);
+                QueueEditorCommand(92);
+            }
+        }
+        int layer = cast<int>(record[15]);
+        if (ui_combo_begin("World layer", LayerName(layer).CString) != 0)
+        {
+            for (int i = 0; i < ed_layer_count(); i++)
+            {
+                if (ui_selectable(LayerName(i).CString, UiFlag(layer == i)) != 0)
+                {
+                    QueueEditorCommand(6000 + i);
+                }
+            }
+            ui_combo_end();
+        }
+        ui_section("Object");
+        bool tile = record[0] == 6.0f && ed_asset_kind(cast<int>(record[8])) == 5;
+        if (tile)
+        {
+            StringBuilder label = StringBuilder();
+            label.Append("Grid footprint: ");
+            label.Append(cast<int>(state[26]));
+            label.Append(" x ");
+            label.Append(cast<int>(state[27]));
+            label.Append(" x ");
+            label.Append(cast<int>(state[28]));
+            label.Append(" m");
+            ui_text(label.ToString().CString);
+        }
+        readonly byte *collision = "Static collider";
+        if (record[10] == 1.0f)
+        {
+            collision = "Dynamic body";
+        }
+        if (record[10] == 2.0f)
+        {
+            collision = "No collision";
+        }
+        if (tile)
+        {
+            collision = "Static tile / mesh collider";
+        }
+        ui_disabled_begin(UiFlag(tile));
+        if (UiFullButton(collision))
+        {
+            QueueEditorCommand(60);
+        }
+        ui_disabled_end();
+        ui_disabled_begin(UiFlag(ed_asset_kind(ed_asset_id()) != 1));
+        if (UiFullButton("Apply selected texture"))
+        {
+            QueueEditorCommand(63);
+        }
+        ui_disabled_end();
+        if (record[0] == 7.0f || record[0] == 8.0f)
+        {
+            StringBuilder label = StringBuilder();
+            label.Append("Strength / volume: ");
+            label.Append(record[11]);
+            ui_text(label.ToString().CString);
+            if (UiButton("-"))
+            {
+                QueueEditorCommand(61);
+            }
+            ui_same_line();
+            if (UiButton("+"))
+            {
+                QueueEditorCommand(62);
+            }
+        }
+        if (UiFullButton("Duplicate  Ctrl+D"))
+        {
+            QueueEditorCommand(91);
+        }
+        if (UiButton("Focus  F"))
+        {
+            QueueEditorCommand(64);
+        }
+        ui_same_line();
+        if (UiButton("Delete"))
+        {
+            QueueEditorCommand(50);
+        }
+        ui_disabled_end();
+    }
+}
+
+static struct InspectorService
+{
+    public static InspectorPanel *Panel;
+}
+
+int InspectorDispatch(int operation, float* state, float* records, float* values)
+{
+    InspectorPanel *panel = InspectorService.Panel;
+    if (operation == 0)
+    {
+        panel->Draw(state, records);
+    }
+    if (operation == 1)
+    {
+        if (!ValidInspectorTransform(&panel->Pending[0]))
+        {
+            panel->Selection = -1;
+            return 0;
+        }
+        for (int i = 0; i < 9; i++)
+        {
+            values[i] = panel->Pending[i];
+        }
+        return 1;
+    }
+    if (operation == 2)
+    {
+        panel->Commit(false);
+    }
+    if (operation == 3)
+    {
+        panel->Editing = false;
+    }
+    return UiFlag(panel->Editing);
+}

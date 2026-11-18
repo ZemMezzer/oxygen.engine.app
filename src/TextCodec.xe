@@ -1,0 +1,157 @@
+using Xenon.Text;
+using Xenon.Collections;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+private
+extern double strtod(readonly byte *value, byte **end);
+extern int ed_atomic_replace(readonly byte *from, readonly byte *to);
+
+// Shared, UTF-8 preserving codec for the existing scene/tile/project text formats.
+struct TextReader
+{
+    public String Text;
+    public int Position;
+
+    public TextReader(String text)
+    {
+        Text = text;
+    }
+
+    public void Space()
+    {
+        while (Position < Text.ByteLength && Text.CString[Position] <= cast<byte>(32))
+        {
+            Position++;
+        }
+    }
+
+    public bool End()
+    {
+        Space();
+        return Position == Text.ByteLength;
+    }
+
+    public String Token()
+    {
+        Space();
+        if (Position >= Text.ByteLength)
+        {
+            throw 1;
+        }
+        bool quoted = Text.CString[Position] == cast<byte>(34);
+        if (quoted)
+        {
+            Position++;
+        }
+        Vector<byte> bytes = Vector<byte>();
+        while (Position < Text.ByteLength)
+        {
+            byte value = Text.CString[Position++];
+            if (quoted && value == cast<byte>(34))
+            {
+                return String(bytes.ReadOnlyData, bytes.Count);
+            }
+            if (!quoted && value <= cast<byte>(32))
+            {
+                return String(bytes.ReadOnlyData, bytes.Count);
+            }
+            if (quoted && value == cast<byte>(92))
+            {
+                if (Position >= Text.ByteLength)
+                {
+                    throw 1;
+                }
+                value = Text.CString[Position++];
+            }
+            bytes.Add(value);
+        }
+        if (quoted)
+        {
+            throw 1;
+        }
+        return String(bytes.ReadOnlyData, bytes.Count);
+    }
+
+    public double Number()
+    {
+        String value = Token();
+        byte *end = null;
+        double number = strtod(value.CString, &end);
+        if (end == value.CString || *end != cast<byte>(0) || number != number || number > 3.402823466e38 ||
+            number < -3.402823466e38)
+        {
+            throw 1;
+        }
+        return number;
+    }
+
+    public int Integer()
+    {
+        double value = Number();
+        if (value < -2147483648.0 || value > 2147483647.0)
+        {
+            throw 1;
+        }
+        int result = cast<int>(value);
+        if (cast<double>(result) != value)
+        {
+            throw 1;
+        }
+        return result;
+    }
+}
+
+void Quoted(StringBuilder* output, readonly String& value)
+{
+    output->Append(cast<char>(34));
+    for (int i = 0; i < value.Length; i++)
+    {
+        char c = value[i];
+        if (c == cast<char>(34) || c == cast<char>(92))
+        {
+            output->Append(cast<char>(92));
+        }
+        output->Append(c);
+    }
+    output->Append(cast<char>(34));
+}
+
+bool SafeAssetPath(readonly String &path)
+{
+    if (path.ByteLength == 0 || path.CString[0] == cast<byte>(47) || path.CString[0] == cast<byte>(92))
+    {
+        return false;
+    }
+    int start = 0;
+    for (int i = 0; i <= path.ByteLength; i++)
+    {
+        if (i < path.ByteLength && (path.CString[i] == cast<byte>(0) || path.CString[i] == cast<byte>(58)))
+        {
+            return false;
+        }
+        if (i == path.ByteLength || path.CString[i] == cast<byte>(47) || path.CString[i] == cast<byte>(92))
+        {
+            if (i - start == 2 && path.CString[start] == cast<byte>(46) &&
+                path.CString[start + 1] == cast<byte>(46))
+            {
+                return false;
+            }
+            start = i + 1;
+        }
+    }
+    return true;
+}
+
+bool SaveTextAtomic(readonly String &path, readonly String &text)
+{
+    String directory = String(Path.GetDirectoryName(path.AsView()));
+    if (!Directory.Exists(directory))
+    {
+        Directory.Create(directory);
+    }
+    String temporary = path + ".tmp";
+    File.WriteAllText(temporary, text);
+    return ed_atomic_replace(temporary.CString, path.CString) != 0;
+}

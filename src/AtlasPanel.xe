@@ -1,0 +1,135 @@
+using Oxygen;
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+extern void ed_bind_atlas_panel(function int(float *, float *, float *, float *, float *) * callback);
+extern int ed_atlas_canvas(float *data, float *settings);
+extern int ui_tab_bar_begin(readonly byte *label);
+extern void ui_tab_bar_end();
+extern int ui_tab_begin(readonly byte *label);
+extern void ui_tab_end();
+extern int ui_int2(readonly byte *label, int *values);
+extern int ui_float2(readonly byte *label, float *values);
+extern void ui_slider_float(readonly byte *label, float *value, float low, float high);
+
+int DrawAtlasPanel(float *data, float *uv, float *corners, float *settings, float *values)
+{
+    if (settings[4] == 0.0f)
+    {
+        return 0;
+    }
+    int face = cast<int>(settings[7]);
+    bool hasFace = face >= 0 && face < TileFaces && data[TileFaceStart + face * TileFaceStride] != 0.0f;
+    if (ui_tab_bar_begin("Atlas modes") != 0)
+    {
+        if (ui_tab_begin("Tileset") != 0)
+        {
+            settings[0] = 0.0f;
+            ui_tab_end();
+        }
+        if (ui_tab_begin("UVs") != 0)
+        {
+            settings[0] = 1.0f;
+            ui_tab_end();
+        }
+        ui_tab_bar_end();
+    }
+    int[] cell = int[2];
+    cell[0] = cast<int>(settings[1]);
+    cell[1] = cast<int>(settings[2]);
+    ui_int2("Cell pixels", &cell[0]);
+    settings[1] = Clamp(cast<float>(cell[0]), 1.0f, settings[5]);
+    settings[2] = Clamp(cast<float>(cell[1]), 1.0f, settings[6]);
+    ui_slider_float("Zoom", settings + 3, 1.0f, 8.0f);
+    int action = ed_atlas_canvas(data, settings);
+    if (settings[0] == 0.0f)
+    {
+        float pixelsX = (uv[2] - uv[0]) * settings[5];
+        float pixelsY = (uv[3] - uv[1]) * settings[6];
+        StringBuilder label = StringBuilder();
+        label.Append("Region: ");
+        label.Append(pixelsX);
+        label.Append(" x ");
+        label.Append(pixelsY);
+        label.Append(" px / ");
+        label.Append(pixelsX / settings[1] * settings[8]);
+        label.Append(" x ");
+        label.Append(pixelsY / settings[2] * settings[8]);
+        label.Append(" m");
+        ui_text(label.ToString().CString);
+        if (UiButton("Full atlas"))
+        {
+            uv[0] = 0.0f;
+            uv[1] = 0.0f;
+            uv[2] = 1.0f;
+            uv[3] = 1.0f;
+            AtlasService.State->HasSelection = true;
+        }
+        ui_disabled_begin(UiFlag(!hasFace || !AtlasService.State->HasSelection));
+        if (UiButton("Use region on selected Face"))
+        {
+            action = 12;
+            values[0] = cast<float>(face);
+            values[8] = uv[0];
+            values[9] = uv[3];
+            values[10] = uv[2];
+            values[11] = uv[3];
+            values[12] = uv[2];
+            values[13] = uv[1];
+            values[14] = uv[0];
+            values[15] = uv[1];
+        }
+        ui_disabled_end();
+    }
+    else
+    {
+        ui_disabled_begin(UiFlag(!hasFace));
+        for (int i = 0; i < 4; i++)
+        {
+            float[] xy = float[2];
+            xy[0] = corners[i * 2] * settings[5];
+            xy[1] = corners[i * 2 + 1] * settings[6];
+            StringBuilder label = StringBuilder();
+            label.Append("Corner ");
+            label.Append(i + 1);
+            if (ui_float2(label.ToString().CString, &xy[0]) != 0)
+            {
+                corners[i * 2] = Clamp(xy[0] / settings[5], 0.0f, 1.0f);
+                corners[i * 2 + 1] = Clamp(xy[1] / settings[6], 0.0f, 1.0f);
+                action = 24;
+                values[0] = cast<float>(face);
+                for (int n = 0; n < 8; n++)
+                {
+                    values[n + 8] = corners[n];
+                }
+            }
+            if (ui_item_query(3) != 0)
+            {
+                action = 16;
+            }
+        }
+        int operation = 0;
+        if (UiIcon("Rotate UV 90", 4))
+        {
+            operation = 4;
+        }
+        ui_same_line();
+        if (UiIcon("Mirror UV", 12))
+        {
+            operation = 5;
+        }
+        if (operation != 0)
+        {
+            AtlasDispatch(operation, data, uv, corners, null, values, null);
+            action = 12;
+            values[0] = cast<float>(face);
+            for (int n = 0; n < 8; n++)
+            {
+                values[n + 8] = corners[n];
+            }
+        }
+        ui_disabled_end();
+    }
+    return action;
+}

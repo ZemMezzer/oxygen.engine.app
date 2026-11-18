@@ -4,7 +4,9 @@ namespace OxygenEditor;
 
 int EditorChecks(Editor *editor)
 {
-    int failures = ed_workspace_tests() + ed_gizmo_tests();
+    int failures = ed_workspace_tests() + ed_layer_tests() + ed_gizmo_tests() + TileChecks() +
+                   TileDuplicateChecks() + TileDeleteChecks() + GridChecks() + LayerDeleteChecks() +
+                   ed_layer_properties_tests() + LayerProtectionChecks();
     Document tilted = Document();
     int slot = tilted.Add(2, Vector3(1.0f, 2.0f, 3.0f), 0.0f, 0, 0);
     tilted.Data[slot * Stride + 13] = 90.0f;
@@ -163,5 +165,326 @@ int EditorChecks(Editor *editor)
         Log("PASS: tile painting/replacement, independent floor layer, stroke Undo and circular history branching.");
     }
 
+    return failures;
+}
+
+int TileDeleteChecks()
+{
+    int failures = 0;
+    TileDocument mesh = TileDocument();
+    mesh.Values[3] = 1.0f;
+    mesh.Values[4] = 1.0f;
+    for (int i = 0; i < 3; i++)
+    {
+        mesh.Values[0] = cast<float>(i) * 2.0f;
+        mesh.Edit(2);
+    }
+    int loose = mesh.Vertex(Vector3(9.0f, 9.0f, 9.0f));
+    mesh.Commit();
+    int baseline = mesh.Cursor;
+    mesh.ClearSelection();
+    mesh.Edit(27);
+    mesh.Commit();
+    if (mesh.Cursor != baseline || mesh.Data[loose * 4] != 1.0f)
+    {
+        failures++;
+    }
+    for (int i = 0; i < 8; i++)
+    {
+        mesh.Selection[i] = 1.0f;
+    }
+    mesh.Edit(27);
+    mesh.Commit();
+    if (mesh.Data[TileFaceStart] != 0.0f || mesh.Data[TileFaceStart + TileFaceStride] != 0.0f ||
+        mesh.Data[TileFaceStart + 2 * TileFaceStride] != 1.0f || mesh.Data[0] != 0.0f ||
+        mesh.Data[8 * 4] != 1.0f || mesh.Data[loose * 4] != 1.0f || mesh.Cursor != baseline + 1)
+    {
+        failures++;
+    }
+    mesh.Restore(baseline);
+    if (mesh.Data[TileFaceStart] != 1.0f || mesh.Data[TileFaceStart + TileFaceStride] != 1.0f ||
+        mesh.Data[0] != 1.0f)
+    {
+        failures++;
+    }
+    mesh.ClearSelection();
+    mesh.Selection[0] = 1.0f;
+    mesh.Selection[4] = 1.0f;
+    mesh.Edit(7);
+    mesh.Commit();
+    if (mesh.Data[0] != 0.0f || mesh.Data[4 * 4] != 0.0f || mesh.Data[1 * 4] != 1.0f ||
+        mesh.Data[TileFaceStart] != 0.0f || mesh.Data[TileFaceStart + TileFaceStride] != 0.0f ||
+        mesh.Data[TileFaceStart + 2 * TileFaceStride] != 1.0f)
+    {
+        failures++;
+    }
+    mesh.Restore(baseline);
+    for (int i = 0; i < 12; i++)
+    {
+        if (mesh.Data[i * 4] != 1.0f)
+        {
+            failures++;
+        }
+    }
+    // Deleting a face sharing vertices must preserve the neighbour's geometry.
+    mesh.ClearSelection();
+    mesh.Data[TileFaceStart + TileFaceStride + 1] = 1.0f;
+    mesh.Data[TileFaceStart + TileFaceStride + 4] = 2.0f;
+    for (int i = 0; i < 4; i++)
+    {
+        mesh.Selection[i] = 1.0f;
+    }
+    mesh.Edit(27);
+    if (mesh.Data[TileFaceStart + TileFaceStride] != 1.0f || mesh.Data[4] != 1.0f || mesh.Data[8] != 1.0f)
+    {
+        failures++;
+    }
+    if (failures == 0)
+    {
+        Log("PASS: group Face/vertex deletion, dependent faces, shared/loose vertices and single-step Undo.");
+    }
+    return failures;
+}
+
+int TileDuplicateChecks()
+{
+    int failures = 0;
+    TileDocument mesh = TileDocument();
+    mesh.Vertex(Vector3(0.0f, 0.0f, 0.0f));
+    mesh.Vertex(Vector3(1.0f, 0.0f, 0.0f));
+    mesh.Vertex(Vector3(1.0f, 1.0f, 0.0f));
+    mesh.Vertex(Vector3(0.0f, 1.0f, 0.0f));
+    mesh.Vertex(Vector3(2.0f, 0.0f, 0.0f));
+    mesh.Vertex(Vector3(2.0f, 1.0f, 0.0f));
+    for (int i = 0; i < 8; i++)
+    {
+        mesh.Values[8 + i] = cast<float>(i) * 0.1f;
+    }
+    mesh.Face(0, 1, 2, 3);
+    mesh.Values[8] = 0.8f;
+    mesh.Face(1, 4, 5, 2);
+    mesh.Commit();
+    int baseline = mesh.Cursor;
+    int first = mesh.DuplicateFaces();
+    mesh.Commit();
+    int copyA = TileFaceStart + 2 * TileFaceStride;
+    int copyB = copyA + TileFaceStride;
+    if (first != 2 || mesh.Cursor != baseline + 1 || mesh.Data[copyA + 2] != mesh.Data[copyB + 1] ||
+        mesh.Data[copyA + 3] != mesh.Data[copyB + 4])
+    {
+        failures++;
+    }
+    for (int i = 0; i < 6; i++)
+    {
+        if (mesh.Selection[i] != 0.0f || mesh.Selection[i + 6] != 1.0f ||
+            Length(Subtract(mesh.Position(i), mesh.Position(i + 6))) > 0.001f)
+        {
+            failures++;
+        }
+    }
+    for (int i = 5; i < TileFaceStride; i++)
+    {
+        if (mesh.Data[TileFaceStart + i] != mesh.Data[copyA + i] ||
+            mesh.Data[TileFaceStart + TileFaceStride + i] != mesh.Data[copyB + i])
+        {
+            failures++;
+        }
+    }
+    // The immediately following gizmo gesture affects only copies.
+    for (int i = 0; i < 16; i++)
+    {
+        mesh.Values[i] = 0.0f;
+    }
+    mesh.Values[0] = 3.0f;
+    mesh.Values[6] = 1.0f;
+    mesh.Values[7] = 1.0f;
+    mesh.Values[8] = 1.0f;
+    mesh.Values[15] = 1.0f;
+    mesh.TransformGesture();
+    if (Abs(mesh.Position(0).X) > 0.001f || Abs(mesh.Position(6).X - 3.0f) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Restore(baseline + 1);
+    mesh.Restore(baseline);
+    if (mesh.Data[copyA] != 0.0f || mesh.Data[copyB] != 0.0f || mesh.Data[6 * 4] != 0.0f)
+    {
+        failures++;
+    }
+    mesh.Restore(baseline + 1);
+    if (mesh.Data[copyA] != 1.0f || mesh.Data[copyB] != 1.0f || Abs(mesh.Position(6).X) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Restore(baseline);
+    mesh.ClearSelection();
+    mesh.Selection[0] = 1.0f;
+    if (mesh.DuplicateFaces() != -1 || mesh.Selection[0] != 1.0f)
+    {
+        failures++;
+    }
+    // Capacity failure must leave both geometry and original selection intact.
+    for (int i = 0; i < 6; i++)
+    {
+        mesh.Selection[i] = 1.0f;
+    }
+    for (int i = 6; i < TileVertices - 1; i++)
+    {
+        mesh.Data[i * 4] = 1.0f;
+    }
+    if (mesh.DuplicateFaces() != -1 || mesh.Data[copyA] != 0.0f ||
+        mesh.Data[(TileVertices - 1) * 4] != 0.0f || mesh.Selection[0] != 1.0f)
+    {
+        failures++;
+    }
+    if (failures == 0)
+    {
+        Log("PASS: Face duplication preserves UV/shared topology, selects only copies, gizmo move, Undo/Redo and atomic capacity rejection.");
+    }
+    return failures;
+}
+
+int TileChecks()
+{
+    int failures = ed_tile_tests() + EditorControllerChecks();
+    TileDocument mesh = TileDocument();
+    mesh.Values[3] = 2.0f;
+    mesh.Values[4] = 3.0f;
+    mesh.Values[8] = 0.25f;
+    mesh.Values[9] = 0.75f;
+    mesh.Values[10] = 0.75f;
+    mesh.Values[11] = 0.75f;
+    mesh.Values[12] = 0.75f;
+    mesh.Values[13] = 0.25f;
+    mesh.Values[14] = 0.25f;
+    mesh.Values[15] = 0.25f;
+    mesh.Edit(2);
+    mesh.Commit();
+    int vertices = 0;
+    int faces = 0;
+    for (int i = 0; i < TileVertices; i++)
+    {
+        if (mesh.Data[i * 4] != 0.0f)
+        {
+            vertices++;
+        }
+    }
+    for (int i = 0; i < TileFaces; i++)
+    {
+        if (mesh.Data[TileFaceStart + i * TileFaceStride] != 0.0f)
+        {
+            faces++;
+        }
+    }
+    if (vertices != 4 || faces != 1 || Abs(mesh.Position(0).X + 1.0f) > 0.001f ||
+        Abs(mesh.Position(2).Y - 1.5f) > 0.001f)
+    {
+        failures++;
+    }
+    // Crop the left quarter and top half: geometry and UV must shrink together.
+    mesh.Values[0] = 0.0f;
+    mesh.Values[1] = 0.25f;
+    mesh.Values[2] = 0.0f;
+    mesh.Values[3] = 1.0f;
+    mesh.Values[4] = 0.5f;
+    mesh.Edit(22);
+    mesh.Commit();
+    if (Abs(mesh.Position(0).X + 0.5f) > 0.001f || Abs(mesh.Position(2).Y) > 0.001f ||
+        Abs(mesh.Data[TileFaceStart + 5] - 0.375f) > 0.001f ||
+        Abs(mesh.Data[TileFaceStart + 10] - 0.5f) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Restore(mesh.Cursor - 1);
+    if (Abs(mesh.Position(0).X + 1.0f) > 0.001f || Abs(mesh.Data[TileFaceStart + 5] - 0.25f) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Values[8] = 0.4f;
+    mesh.Edit(12);
+    mesh.Commit();
+    if (Abs(mesh.Position(0).X + 1.0f) > 0.001f || Abs(mesh.Data[TileFaceStart + 5] - 0.4f) > 0.001f ||
+        mesh.Count != 3)
+    {
+        failures++;
+    }
+    mesh.Edit(14);
+    mesh.Commit();
+    if (mesh.Data[0] != 0.0f || mesh.Data[TileFaceStart] != 0.0f)
+    {
+        failures++;
+    }
+    mesh.Restore(mesh.Cursor - 1);
+    if (mesh.Data[0] != 1.0f || mesh.Data[TileFaceStart] != 1.0f)
+    {
+        failures++;
+    }
+    // A gizmo evaluates from its starting state, preserving UVs and unselected vertices.
+    for (int i = 0; i < 16; i++)
+    {
+        mesh.Values[i] = 0.0f;
+    }
+    mesh.ClearSelection();
+    mesh.Selection[0] = 1.0f;
+    mesh.Values[0] = 0.5f;
+    mesh.Values[6] = 1.0f;
+    mesh.Values[7] = 1.0f;
+    mesh.Values[8] = 1.0f;
+    int gestureStart = mesh.Cursor;
+    mesh.TransformGesture();
+    mesh.TransformGesture();
+    if (Abs(mesh.Position(0).X + 0.5f) > 0.001f || Abs(mesh.Position(1).X - 1.0f) > 0.001f ||
+        Abs(mesh.Data[TileFaceStart + 5] - 0.4f) > 0.001f || mesh.Cursor != gestureStart)
+    {
+        failures++;
+    }
+    // Cancel restores exactly; a release commits the final pointer position once.
+    mesh.Restore(mesh.Cursor);
+    if (Abs(mesh.Position(0).X + 1.0f) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Values[0] = 1.0f;
+    mesh.Values[15] = 1.0f;
+    mesh.TransformGesture();
+    if (Abs(mesh.Position(0).X) > 0.001f || mesh.Cursor != gestureStart + 1)
+    {
+        failures++;
+    }
+    mesh.Restore(gestureStart);
+    mesh.Values[0] = 0.0f;
+    mesh.Values[15] = 0.0f;
+    mesh.Values[6] = 2.0f;
+    mesh.Values[5] = 90.0f;
+    mesh.TransformGesture();
+    if (Abs(mesh.Position(0).X - 1.5f) > 0.001f || Abs(mesh.Position(0).Y + 2.0f) > 0.001f)
+    {
+        failures++;
+    }
+    mesh.Restore(gestureStart);
+    mesh.Values[0] = 0.0f;
+    // Legacy shared vertices: trimming one face must not deform its neighbour.
+    mesh.Values[8] = 0.0f;
+    mesh.Values[9] = 1.0f;
+    mesh.Values[10] = 1.0f;
+    mesh.Values[11] = 1.0f;
+    mesh.Values[12] = 1.0f;
+    mesh.Values[13] = 0.0f;
+    mesh.Values[14] = 0.0f;
+    mesh.Values[15] = 0.0f;
+    mesh.Face(0, 1, 2, 3);
+    mesh.Values[1] = 0.5f;
+    mesh.Values[2] = 0.0f;
+    mesh.Values[3] = 1.0f;
+    mesh.Values[4] = 1.0f;
+    mesh.Edit(22);
+    if (Abs(mesh.Position(0).X + 1.0f) > 0.001f || mesh.Data[TileFaceStart + 1] < 4.0f)
+    {
+        failures++;
+    }
+    if (failures == 0)
+    {
+        Log("PASS: atlas Face, crop/UV, gizmo vertex transforms, cancellation, single-step Undo and shared-face isolation.");
+    }
     return failures;
 }

@@ -1,0 +1,56 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+void UpdateTileCanvasSelection(float *data, float *selection, float *camera, float *input, float *output)
+{
+    TileRectangleSelection *rectangle = SelectionService.Rectangle;
+    int face = cast<int>(input[3]);
+    int mode = cast<int>(input[2]);
+    if (input[4] != 0.0f && !rectangle->Active && input[5] == 0.0f && input[6] == 0.0f && input[7] == 0.0f &&
+        input[8] != 0.0f)
+    {
+        int previous = face;
+        float[] picked = float[2];
+        PickTileElement(data, camera, input, &picked[0]);
+        int index = cast<int>(picked[0]);
+        face = cast<int>(picked[1]);
+        if ((mode == 1 || mode == 2) && index < 0)
+        {
+            float[] start = float[5];
+            start[0] = input[0];
+            start[1] = input[1];
+            start[2] = input[9];
+            start[3] = cast<float>(UiFlag(mode == 2));
+            start[4] = cast<float>(previous);
+            rectangle->Begin(selection, &start[0]);
+        }
+        float[] pick = float[4];
+        pick[0] = cast<float>(index);
+        pick[1] = cast<float>(face);
+        pick[2] = cast<float>(mode);
+        pick[3] = input[9];
+        ApplyTilePick(data, selection, &pick[0]);
+    }
+    if (rectangle->Active)
+    {
+        bool dragged = rectangle->Dragged ||
+                       ScreenDistance(ScreenPoint(input[0], input[1]),
+                                      ScreenPoint(rectangle->StartX, rectangle->StartY)) >= input[10];
+        float[] update = float[8];
+        update[0] = input[0];
+        update[1] = input[1];
+        update[2] = camera[12];
+        update[3] = camera[13];
+        update[4] = cast<float>(UiFlag(dragged));
+        update[5] = cast<float>(UiFlag(input[11] == 0.0f));
+        update[6] = input[12];
+        update[7] = cast<float>(face);
+        face = rectangle->Update(data, selection, camera, &update[0]);
+    }
+    output[0] = cast<float>(face);
+    output[1] = cast<float>(UiFlag(rectangle->Active));
+    output[2] = cast<float>(UiFlag(rectangle->Dragged));
+    output[3] = rectangle->StartX;
+    output[4] = rectangle->StartY;
+}

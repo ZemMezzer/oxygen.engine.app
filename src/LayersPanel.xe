@@ -1,0 +1,285 @@
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+struct LayerForms
+{
+    public byte[] NewName;
+    public byte[] RenameName;
+    public bool NewInvalid;
+    public bool RenameInvalid;
+    public int RenameSource;
+    public int DeleteSource;
+    public int DeleteTarget;
+    public int DeleteMode;
+
+    public LayerForms()
+    {
+        NewName = new byte[128];
+        RenameName = new byte[128];
+        RenameSource = -1;
+        DeleteSource = -1;
+    }
+
+    public ~LayerForms()
+    {
+        delete (NewName);
+        delete (RenameName);
+    }
+
+    public void Create()
+    {
+        if (UiButton("New Layer"))
+        {
+            WorkspaceModelDispatch(9, 0, null, null, &NewName[0]);
+            NewInvalid = false;
+            ui_popup_open("New layer");
+        }
+        if (ui_popup_begin("New layer") == 0)
+        {
+            return;
+        }
+        if (ui_query(6) != 0)
+        {
+            ui_focus_keyboard();
+        }
+        bool enter = ui_input_text("Name", &NewName[0], 128, 1) != 0;
+        if (NewInvalid)
+        {
+            ui_text("Use a non-empty, unique name; shorten it if necessary.");
+        }
+        if (UiButton("Create") || enter)
+        {
+            if (ed_layer_add(&NewName[0]) >= 0)
+            {
+                QueueEditorCommand(109);
+                ui_popup_close();
+            }
+            else
+            {
+                NewInvalid = true;
+            }
+        }
+        ui_same_line();
+        if (UiButton("Cancel") || UiKey(256))
+        {
+            ui_popup_close();
+        }
+        ui_popup_end();
+    }
+
+    public void Delete(float *state, float *records)
+    {
+        ui_same_line();
+        int active = cast<int>(state[24]);
+        bool allowed = ed_layer_count() > 1 && ed_layer_editable(active) != 0;
+        ui_disabled_begin(UiFlag(!allowed));
+        bool keyboard = UiKeyboardAvailable(state) && UiKey(261);
+        if (UiButton("Delete Layer") || (keyboard && allowed))
+        {
+            DeleteSource = active;
+            DeleteTarget = 0;
+            if (active == 0)
+            {
+                DeleteTarget = 1;
+            }
+            DeleteMode = 0;
+            ui_popup_open("Delete layer");
+        }
+        ui_disabled_end();
+        if (ui_popup_begin("Delete layer") == 0)
+        {
+            return;
+        }
+        int objects = WorkspaceModelDispatch(10, DeleteSource, records, null, null);
+        String heading = String("Delete ") + LayerName(DeleteSource) + String("?");
+        ui_text(heading.CString);
+        StringBuilder label = StringBuilder();
+        label.Append("Objects: ");
+        label.Append(objects);
+        ui_text(label.ToString().CString);
+        if (objects > 0)
+        {
+            if (ui_radio("Move objects to another layer", UiFlag(DeleteMode == 0)) != 0)
+            {
+                DeleteMode = 0;
+            }
+            if (DeleteMode == 0 && ui_combo_begin("Destination", LayerName(DeleteTarget).CString) != 0)
+            {
+                for (int i = 0; i < ed_layer_count(); i++)
+                {
+                    if (i == DeleteSource || ed_layer_editable(i) == 0)
+                    {
+                        continue;
+                    }
+                    ui_push_id(i);
+                    if (ui_selectable(LayerName(i).CString, UiFlag(DeleteTarget == i)) != 0)
+                    {
+                        DeleteTarget = i;
+                    }
+                    ui_pop_id();
+                }
+                ui_combo_end();
+            }
+            if (ui_radio("Delete objects with the layer", UiFlag(DeleteMode == 1)) != 0)
+            {
+                DeleteMode = 1;
+            }
+        }
+        ui_disabled_begin(UiFlag(DeleteMode == 0 && ed_layer_editable(DeleteTarget) == 0));
+        if (UiButton("Delete"))
+        {
+            int target = DeleteTarget;
+            if (DeleteMode == 1)
+            {
+                target = -1;
+            }
+            ed_layer_delete_view(DeleteSource, target);
+            QueueEditorCommand(111);
+            ui_popup_close();
+        }
+        ui_disabled_end();
+        ui_same_line();
+        if (UiButton("Cancel") || UiKey(256))
+        {
+            ui_popup_close();
+        }
+        ui_popup_end();
+    }
+
+    public void Rename(float *state)
+    {
+        if (UiButton("Rename") || (UiKeyboardAvailable(state) && UiKey(291)))
+        {
+            RenameSource = cast<int>(state[24]);
+            CopyText(&RenameName[0], LayerName(RenameSource));
+            RenameInvalid = false;
+            ui_popup_open("Rename layer");
+        }
+        if (ui_popup_begin("Rename layer") == 0)
+        {
+            return;
+        }
+        if (ui_query(6) != 0)
+        {
+            ui_focus_keyboard();
+        }
+        bool enter = ui_input_text("Name", &RenameName[0], 128, 3) != 0;
+        if (RenameInvalid)
+        {
+            ui_text("Use a non-empty, unique name (up to 120 bytes).");
+        }
+        if (UiButton("Rename") || enter)
+        {
+            bool changed = !CleanLayerName(&RenameName[0]).Equals(LayerName(RenameSource));
+            if (ed_layer_rename(RenameSource, &RenameName[0]) != 0)
+            {
+                if (changed)
+                {
+                    QueueEditorCommand(112);
+                }
+                ui_popup_close();
+            }
+            else
+            {
+                RenameInvalid = true;
+            }
+        }
+        ui_same_line();
+        if (UiButton("Cancel") || UiKey(256))
+        {
+            ui_popup_close();
+        }
+        ui_popup_end();
+    }
+}
+
+static struct LayerPanelService
+{
+    public static LayerForms *Forms;
+}
+
+extern void ed_bind_layers_panel(function void(float *, float *) * callback);
+extern void ed_layer_delete_view(int source, int target);
+
+String LayerName(int index)
+{
+    if (index < 0 || index >= ed_layer_count())
+    {
+        return String("Unknown layer");
+    }
+    return LayerService.Layers->Get(index)->Name;
+}
+
+void DrawLayersPanel(float *state, float *records)
+{
+    if (UiKeyboardAvailable(state) && ui_query(4) != 0)
+    {
+        bool shift = ui_query(5) != 0;
+        bool redo = UiKey(89) || (shift && UiKey(90));
+        if (redo && state[19] != 0.0f)
+        {
+            QueueEditorCommand(8);
+        }
+        else if (!shift && UiKey(90) && state[18] != 0.0f)
+        {
+            QueueEditorCommand(7);
+        }
+    }
+    ui_disabled_begin(UiFlag(state[6] != 0.0f));
+    LayerPanelService.Forms->Create();
+    LayerPanelService.Forms->Delete(state, records);
+    LayerPanelService.Forms->Rename(state);
+    ui_same_line();
+    int solo = UiFlag(state[25] != 0.0f);
+    if (ui_checkbox("Isolate", &solo) != 0)
+    {
+        QueueEditorCommand(108);
+    }
+    ui_separator();
+    if (ui_table_begin("Layer list", 3, 0) != 0)
+    {
+        ui_table_column("Layer", 0.0f);
+        ui_table_column("Visible", 48.0f);
+        ui_table_column("Locked", 48.0f);
+        ui_table_headers();
+        for (int i = 0; i < ed_layer_count(); i++)
+        {
+            ui_push_id(i);
+            ui_table_row();
+            ui_table_next();
+            if (ui_selectable(LayerName(i).CString, UiFlag(cast<int>(state[24]) == i)) != 0)
+            {
+                QueueEditorCommand(1000 + i);
+            }
+            ui_table_next();
+            int flags = LayerFlags(i);
+            int visible = UiFlag((flags & 1) == 0);
+            int locked = UiFlag((flags & 2) != 0);
+            if (ui_checkbox("##visible", &visible) != 0)
+            {
+                int next = flags | 1;
+                if (visible != 0)
+                {
+                    next = flags & ~1;
+                }
+                ed_layer_set_flags(i, next);
+                QueueEditorCommand(112);
+            }
+            ui_table_next();
+            if (ui_checkbox("##locked", &locked) != 0)
+            {
+                int next = flags & ~2;
+                if (locked != 0)
+                {
+                    next = flags | 2;
+                }
+                ed_layer_set_flags(i, next);
+                QueueEditorCommand(112);
+            }
+            ui_pop_id();
+        }
+        ui_table_end();
+    }
+    ui_disabled_end();
+}

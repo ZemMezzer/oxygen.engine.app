@@ -1,0 +1,327 @@
+using Oxygen;
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+// View buffer: face, mode, tool, focus, gizmo, marquee, UV gesture, atlas drag,
+// atlas selection, dirty, duplicate pending, plane, offset, metres, snap, grid,
+// edges, texture id, texture width/height, action, history cursor/count.
+extern void ed_bind_tile_panel(function void(int, float *, float *, float *, float *, byte *) * callback);
+extern int ui_icon(readonly byte *label, int icon, int selected);
+extern int ui_header(readonly byte *label);
+extern int ui_float4(readonly byte *label, float *values);
+extern int ui_drag_float(readonly byte *label, float *value, float speed, float minimum, float maximum);
+extern readonly byte *ed_tile_panel_text(int kind);
+extern void ed_tile_panel_texture(readonly byte *path);
+extern int ed_tile_panel_action(int action);
+extern int ed_tile_atlas_draw(float *data, float *view);
+
+bool UiIcon(readonly byte *label, int icon)
+{
+    return ui_icon(label, icon, 0) != 0;
+}
+
+int FirstSelectedTileFace(float *data, float *selection)
+{
+    for (int i = 0; i < TileFaces; i++)
+    {
+        int at = TileFaceStart + i * TileFaceStride;
+        if (data[at] != 0.0f && selection[cast<int>(data[at + 1])] != 0.0f &&
+            selection[cast<int>(data[at + 2])] != 0.0f && selection[cast<int>(data[at + 3])] != 0.0f &&
+            selection[cast<int>(data[at + 4])] != 0.0f)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+struct TilePanel
+{
+    public float[] StatisticsData;
+    public float[] Trim;
+    public int Vertices;
+    public int Triangles;
+
+    public TilePanel()
+    {
+        StatisticsData = new float[TileDataSize];
+        Trim = new float[4];
+    }
+
+    public ~TilePanel()
+    {
+        delete (StatisticsData);
+        delete (Trim);
+    }
+
+    public void Statistics(float *data)
+    {
+        bool changed = false;
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            if (StatisticsData[i] != data[i])
+            {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed)
+        {
+            return;
+        }
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            StatisticsData[i] = data[i];
+        }
+        unique<float[]> vertices = new float[TileFaces * 6 * 8];
+        unique<ushort[]> indices = new ushort[TileFaces * 6];
+        int[] counts = int[3];
+        CompileTileMesh(data, &vertices[0], &indices[0], &counts[0]);
+        Vertices = counts[0];
+        Triangles = counts[1] / 3;
+    }
+
+    public void Tools(float *data, float *selection, float *view, float *values, byte *name)
+    {
+        bool gesture = view[4] != 0.0f || view[5] != 0.0f || view[6] != 0.0f;
+        ui_disabled_begin(UiFlag(gesture));
+        if (UiIcon("Save Tile", 9) && ed_tile_panel_action(0) != 0)
+        {
+            view[9] = 0.0f;
+        }
+        ui_same_line();
+        ui_disabled_begin(UiFlag(view[21] <= 0.0f));
+        if (UiIcon("Undo", 6))
+        {
+            view[20] = 20.0f;
+        }
+        ui_disabled_end();
+        ui_same_line();
+        ui_disabled_begin(UiFlag(view[21] + 1.0f >= view[22]));
+        if (UiIcon("Redo", 7))
+        {
+            view[20] = 21.0f;
+        }
+        ui_disabled_end();
+        ui_same_line();
+        if (UiIcon("Frame all", 8))
+        {
+            ed_tile_panel_action(1);
+        }
+        ui_disabled_end();
+        bool keyboard = view[3] != 0.0f && !gesture && ui_query(1) == 0;
+        if (keyboard && ui_query(4) != 0)
+        {
+            if (UiKey(83) && ed_tile_panel_action(0) != 0)
+            {
+                view[9] = 0.0f;
+            }
+            if (UiKey(90) && view[21] > 0.0f)
+            {
+                view[20] = 20.0f;
+            }
+            if (UiKey(89) && view[21] + 1.0f < view[22])
+            {
+                view[20] = 21.0f;
+            }
+            if (view[7] == 0.0f && view[8] == 0.0f && UiKey(68) &&
+                FirstSelectedTileFace(data, selection) >= 0)
+            {
+                view[20] = 26.0f;
+                view[10] = 1.0f;
+            }
+        }
+        if (keyboard && view[7] == 0.0f && view[8] == 0.0f && ui_query(2) == 0 && UiKey(261))
+        {
+            view[20] = 27.0f;
+            if (view[1] == 1.0f)
+            {
+                view[20] = 7.0f;
+            }
+            view[0] = -1.0f;
+        }
+        Statistics(data);
+        ui_same_line();
+        StringBuilder stats = StringBuilder();
+        stats.Append("Runtime: 1 mesh / 1 material / ");
+        stats.Append(Vertices);
+        stats.Append(" vertices / ");
+        stats.Append(Triangles);
+        stats.Append(" triangles");
+        ui_text_disabled(stats.ToString().CString);
+        ui_separator();
+        ui_child_begin("Tile tools", 350.0f, 0.0f, 1);
+        if (ui_input_text("Name", name, 128, 0) != 0)
+        {
+            view[9] = 1.0f;
+        }
+        String tileset = String(ed_tile_panel_text(0));
+        if (tileset.ByteLength == 0)
+        {
+            tileset = String("Create one in Tiles");
+        }
+        ui_text_wrapped((String("Tileset: ") + tileset).CString);
+        String texture = String(ed_tile_panel_text(1));
+        String textureLabel = String(ed_tile_panel_text(2));
+        if (textureLabel.ByteLength == 0)
+        {
+            textureLabel = String("Choose texture");
+        }
+        if (ui_combo_begin("Atlas", textureLabel.CString) != 0)
+        {
+            for (int i = 0; i < ProjectService.State->Assets.Count; i++)
+            {
+                EditorAsset *asset = ProjectService.State->Assets.Get(i);
+                if (asset->Kind == 1 &&
+                    ui_selectable(asset->Path.CString, UiFlag(asset->Path.Equals(texture))) != 0)
+                {
+                    ed_tile_panel_texture(asset->Path.CString);
+                    view[9] = 1.0f;
+                }
+            }
+            ui_combo_end();
+        }
+        int atlasAction = ed_tile_atlas_draw(data, view);
+        if (atlasAction != 0)
+        {
+            view[20] = cast<float>(atlasAction);
+        }
+        int face = cast<int>(view[0]);
+        bool hasFace = face >= 0 && data[TileFaceStart + face * TileFaceStride] != 0.0f;
+        ui_section("Selected Face");
+        ui_disabled_begin(UiFlag(!hasFace));
+        StringBuilder label = StringBuilder();
+        label.Append("Face #");
+        label.Append(face + 1);
+        ui_text(label.ToString().CString);
+        if (UiIcon("Flip side", 10))
+        {
+            view[20] = 13.0f;
+            values[0] = cast<float>(face);
+        }
+        ui_same_line();
+        if (UiIcon("Delete Face", 11))
+        {
+            view[20] = 14.0f;
+            values[0] = cast<float>(face);
+        }
+        if (ui_header("Trim Face + UV") != 0)
+        {
+            ui_float4("L / R / B / T pixels", &Trim[0]);
+            if (UiButton("Apply trim") && hasFace && view[17] != 0.0f)
+            {
+                float[] input = float[3];
+                input[0] = cast<float>(face);
+                input[1] = view[18];
+                input[2] = view[19];
+                int result = TrimTileFace(data, &Trim[0], &input[0], values);
+                if (result != 0)
+                {
+                    view[20] = cast<float>(result);
+                }
+            }
+        }
+        ui_disabled_end();
+        ui_child_end();
+    }
+
+    public void ViewportTools(float *view)
+    {
+        ui_disabled_begin(UiFlag(view[4] != 0.0f || view[5] != 0.0f || view[7] != 0.0f));
+        if (ui_icon("Vertices", 1, UiFlag(view[1] == 1.0f)) != 0)
+        {
+            view[1] = 1.0f;
+        }
+        ui_same_line();
+        if (ui_icon("Faces", 2, UiFlag(view[1] == 2.0f)) != 0)
+        {
+            view[1] = 2.0f;
+        }
+        ui_same_line();
+        if (ui_icon("Object", 0, UiFlag(view[1] == 0.0f)) != 0)
+        {
+            view[1] = 0.0f;
+        }
+        ui_same_line();
+        if (ui_icon("Move", 3, UiFlag(view[2] == 0.0f)) != 0)
+        {
+            view[2] = 0.0f;
+        }
+        ui_same_line();
+        if (ui_icon("Rotate", 4, UiFlag(view[2] == 1.0f)) != 0)
+        {
+            view[2] = 1.0f;
+        }
+        ui_same_line();
+        if (ui_icon("Scale", 5, UiFlag(view[2] == 2.0f)) != 0)
+        {
+            view[2] = 2.0f;
+        }
+        ui_disabled_end();
+        if (view[3] != 0.0f && view[4] == 0.0f && view[5] == 0.0f && ui_query(1) == 0 && ui_query(4) == 0)
+        {
+            if (UiKey(87))
+            {
+                view[2] = 0.0f;
+            }
+            if (UiKey(69))
+            {
+                view[2] = 1.0f;
+            }
+            if (UiKey(82))
+            {
+                view[2] = 2.0f;
+            }
+        }
+        readonly byte *plane = "Front XY";
+        if (view[11] == 1.0f)
+        {
+            plane = "Ground XZ";
+        }
+        if (view[11] == 2.0f)
+        {
+            plane = "Side YZ";
+        }
+        ui_item_width(130.0f);
+        if (ui_combo_begin("Draw plane", plane) != 0)
+        {
+            if (ui_selectable("Front XY", UiFlag(view[11] == 0.0f)) != 0)
+            {
+                view[11] = 0.0f;
+            }
+            if (ui_selectable("Ground XZ", UiFlag(view[11] == 1.0f)) != 0)
+            {
+                view[11] = 1.0f;
+            }
+            if (ui_selectable("Side YZ", UiFlag(view[11] == 2.0f)) != 0)
+            {
+                view[11] = 2.0f;
+            }
+            ui_combo_end();
+        }
+        ui_item_width(85.0f);
+        ui_input_float("Plane offset", view + 12);
+        ui_same_line();
+        ui_item_width(85.0f);
+        ui_input_float("Metres / atlas cell", view + 13);
+        view[13] = Clamp(view[13], 0.01f, 20.0f);
+        int snap = UiFlag(view[14] != 0.0f);
+        ui_checkbox("Snap", &snap);
+        view[14] = cast<float>(snap);
+        ui_same_line();
+        ui_item_width(75.0f);
+        ui_drag_float("metres", view + 15, 0.01f, 0.01f, 2.0f);
+        ui_same_line();
+        int wire = UiFlag(view[16] != 0.0f);
+        ui_checkbox("Edges", &wire);
+        view[16] = cast<float>(wire);
+        ui_same_line();
+        ui_text_disabled("Grid: 2 m");
+    }
+}
+
+static struct TilePanelService
+{
+    public static TilePanel *Panel;
+}

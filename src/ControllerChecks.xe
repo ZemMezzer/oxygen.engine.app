@@ -1,0 +1,84 @@
+using Oxygen;
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+int EditorControllerChecks()
+{
+    int failures = 0;
+    TileDocument document = TileDocument();
+    float[] view = float[16];
+    byte[] name = byte[128];
+    TileSessionDispatch(3, null, null, null, null, null);
+    int action = TileSessionDispatch(0, &document.Data[0], &document.Selection[0], &view[0], &name[0], null);
+    if (action != 1 || view[0] != 1.0f || view[1] != 0.0f || view[3] != -1.0f ||
+        !String(&name[0]).Equals(String("Untitled")))
+    {
+        Log("FAIL: new tile session state.");
+        failures++;
+    }
+    TileSessionDispatch(5, null, null, null, null, "Tiles/tile_Regression/grid-unit.oxtile");
+    action = TileSessionDispatch(0, &document.Data[0], &document.Selection[0], &view[0], &name[0], null);
+    if (action != 23 || document.Data[0] != 1.0f || document.Data[TileFaceStart] != 1.0f ||
+        !String(&name[0]).Equals(String("Grid")))
+    {
+        Log("FAIL: resource tile request did not load into the editor.");
+        failures++;
+    }
+    float firstX = document.Data[1];
+    TileSessionDispatch(4, null, null, null, null, "Tiles/tile_Regression/broken.oxtile");
+    action = TileSessionDispatch(0, &document.Data[0], &document.Selection[0], &view[0], &name[0], null);
+    if (action != 0 || document.Data[1] != firstX || !String(&name[0]).Equals(String("Grid")))
+    {
+        Log("FAIL: malformed tile replaced the current editor document.");
+        failures++;
+    }
+    for (int i = 0; i < 4; i++)
+    {
+        document.Selection[i] = 1.0f;
+    }
+    view[6] = 1.0f;
+    TileSessionDispatch(0, &document.Data[0], &document.Selection[0], &view[0], &name[0], null);
+    if (view[6] != 0.0f || view[3] != 0.0f || view[4] != 2.0f || view[5] != 0.0f)
+    {
+        Log("FAIL: duplicate completion did not select the copied Face tool.");
+        failures++;
+    }
+    view[13] = 25.0f;
+    view[14] = 1.0f;
+    TileSessionDispatch(6, &document.Values[0], null, &view[0], null, null);
+    if (view[1] != 1.0f)
+    {
+        failures++;
+    }
+    view[1] = 0.0f;
+    if (TileSessionDispatch(7, null, null, &view[0], null, null) == 0 || view[0] != 0.0f)
+    {
+        failures++;
+    }
+    ed_tile_reset();
+
+    WorkspaceService.Commands->Clear();
+    WorkspaceControllerDispatch(0, 7, null, null);
+    WorkspaceControllerDispatch(0, 8, null, null);
+    if (WorkspaceControllerDispatch(3, 0, null, null) != 7 ||
+        WorkspaceControllerDispatch(3, 0, null, null) != 8 ||
+        WorkspaceControllerDispatch(3, 0, null, null) != 0)
+    {
+        Log("FAIL: native menu commands lost their ordering.");
+        failures++;
+    }
+    WorkspaceService.Commands->Clear();
+    if (EditorMenuEnabled(3, 1, 1, 1, 1) != 0 || EditorMenuEnabled(91, 0, 0, 1, 1) != 0 ||
+        EditorMenuEnabled(7, 0, 1, 0, 1) != 0 || EditorMenuEnabled(6, 1, 0, 0, 0) != 1 ||
+        EditorMenuEnabled(205, 1, 0, 0, 0) != 1)
+    {
+        Log("FAIL: native menu enable policy.");
+        failures++;
+    }
+    if (failures == 0)
+    {
+        Log("PASS: Xenon editor controllers: new/open tile, deferred Resources request, malformed isolation, duplicate tool, dirty/suspend and menu ordering.");
+    }
+    return failures;
+}

@@ -1,0 +1,255 @@
+using Xenon.Text;
+using Xenon.Collections;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+struct EditorAsset
+{
+    public String Path;
+    public int Kind;
+
+    public EditorAsset(String path, int kind)
+    {
+        Path = path;
+        Kind = kind;
+    }
+}
+
+struct ProjectState
+{
+    public String Root;
+    public String Scene;
+    public Vector<EditorAsset> Assets;
+}
+
+static struct ProjectService
+{
+    public static ProjectState *State;
+}
+
+extern void ed_assets_view_clear();
+extern void ed_assets_view_item(int id, int kind, readonly byte *relative);
+extern void ed_project_view_root(readonly byte *root);
+extern void ed_tile_reset();
+extern void ed_bind_project(function int(int, readonly byte *, int) * callback);
+
+void ClearProjectAssets()
+{
+    ed_assets_view_clear();
+    ProjectService.State->Assets.Clear();
+}
+
+int RegisterProjectAsset(readonly String &path)
+{
+    Vector<EditorAsset> *assets = &ProjectService.State->Assets;
+    if (!SafeAssetPath(path) || assets->Count >= 512)
+    {
+        return 0;
+    }
+    for (int i = 0; i < assets->Count; i++)
+    {
+        if (assets->Get(i)->Path.Equals(path))
+        {
+            return i + 1;
+        }
+    }
+    int kind = ResourceKind(path);
+    assets->Add(EditorAsset(path, kind));
+    int id = assets->Count;
+    ed_assets_view_item(id, kind, path.CString);
+    return id;
+}
+
+void SortPaths(Vector<String> *paths, int low, int high)
+{
+    if (low >= high)
+    {
+        return;
+    }
+    int i = low;
+    int j = high;
+    String pivot = *paths->Get(low + (high - low) / 2);
+    while (i <= j)
+    {
+        while (paths->Get(i)->Compare(pivot) < 0)
+        {
+            i++;
+        }
+        while (paths->Get(j)->Compare(pivot) > 0)
+        {
+            j--;
+        }
+        if (i <= j)
+        {
+            String swap = *paths->Get(i);
+            *paths->Get(i) = *paths->Get(j);
+            *paths->Get(j) = swap;
+            i++;
+            j--;
+        }
+    }
+    if (low < j)
+    {
+        SortPaths(paths, low, j);
+    }
+    if (i < high)
+    {
+        SortPaths(paths, i, high);
+    }
+}
+
+void ScanProjectAssets()
+{
+    Vector<FileEntry> entries = ListFiles(AssetRoot(), true);
+    Vector<String> paths = Vector<String>();
+    for (int i = 0; i < entries.Count; i++)
+    {
+        FileEntry *entry = entries.Get(i);
+        if (entry->Kind == 1 && entry->Path.IndexOf(StringView(".generated")) < 0)
+        {
+            paths.Add(NativePath(2, entry->Path, AssetRoot()));
+        }
+    }
+    SortPaths(&paths, 0, paths.Count - 1);
+    for (int i = 0; i < paths.Count; i++)
+    {
+        RegisterProjectAsset(*paths.Get(i));
+    }
+}
+
+bool OpenEditorProject(readonly String &path, bool create)
+{
+    if (path.ByteLength == 0)
+    {
+        return false;
+    }
+    String marker = JoinPath(path, String("oxygen.project"));
+    bool exists = File.Exists(marker);
+    if (!create && !exists)
+    {
+        ed_status("Choose a folder containing oxygen.project.");
+        return false;
+    }
+    if (exists)
+    {
+        TextReader reader = TextReader(File.ReadAllText(marker));
+        if (!reader.Token().Equals(String("OXYGEN_PROJECT")) || reader.Integer() != 1)
+        {
+            ed_status("Unsupported Oxygen project format.");
+            return false;
+        }
+    }
+    if (ed_fs_create_directories(JoinPath(path, String("Assets")).CString) == 0 ||
+        ed_fs_create_directories(JoinPath(path, String("Scenes")).CString) == 0)
+    {
+        return false;
+    }
+    if (!exists && !SaveTextAtomic(marker, String("OXYGEN_PROJECT 1\n")))
+    {
+        return false;
+    }
+    String absolute = NativePath(0, path, String());
+    ed_tile_reset();
+    ClearProjectAssets();
+    ProjectService.State->Root = absolute;
+    ProjectService.State->Scene = JoinPath(absolute, String("Scenes/Main.oxmap"));
+    ResourcePanelService.Panel->Folder = String();
+    ed_project_view_root(absolute.CString);
+    LayerService.Layers->Clear();
+    ed_layer_add("Layer 1");
+    ScanProjectAssets();
+    String status = String("Project: ") + String(Path.GetFileName(absolute.AsView()));
+    ed_status(status.CString);
+    return true;
+}
+
+bool CopyProjectResource(readonly String &source, readonly String &relative)
+{
+    if (!SafeAssetPath(relative) || ed_fs_symlink(source.CString) != 0)
+    {
+        return false;
+    }
+    String destination = AssetFile(relative);
+    if (File.Exists(destination) || Directory.Exists(destination))
+    {
+        return false;
+    }
+    String parent = String(Path.GetDirectoryName(destination.AsView()));
+    return ed_fs_create_directories(parent.CString) != 0 &&
+           ed_fs_copy(source.CString, destination.CString) != 0;
+}
+
+void ImportProjectResources(readonly String &path)
+{
+    int copied = 0;
+    String filename = String(Path.GetFileName(path.AsView()));
+    if (Directory.Exists(path))
+    {
+        String relative = NativePath(2, ProjectService.State->Root, NativePath(0, path, String()));
+        if (relative.ByteLength > 0 && !relative.StartsWith(StringView("..")))
+        {
+            ed_status("Choose a resource folder outside this project.");
+            return;
+        }
+        Vector<FileEntry> entries = ListFiles(path, true);
+        for (int i = 0; i < entries.Count; i++)
+        {
+            FileEntry *entry = entries.Get(i);
+            if (entry->Kind == 1 &&
+                CopyProjectResource(entry->Path, JoinPath(filename, NativePath(2, entry->Path, path))))
+            {
+                copied++;
+            }
+        }
+    }
+    else if (File.Exists(path) && CopyProjectResource(path, filename))
+    {
+        copied++;
+    }
+    ScanProjectAssets();
+    StringBuilder status = StringBuilder();
+    status.Append("Imported ");
+    status.Append(copied);
+    status.Append(" file(s). Existing files were kept.");
+    ed_status(status.ToString().CString);
+}
+
+int ProjectDispatch(int operation, readonly byte *path, int argument)
+{
+    try
+    {
+        if (operation == 4)
+        {
+            ClearProjectAssets();
+            return 1;
+        }
+        if (operation == 2)
+        {
+            ScanProjectAssets();
+            return 1;
+        }
+        if (operation == 0)
+        {
+            if (OpenEditorProject(String(path), argument != 0))
+            {
+                return 1;
+            }
+            return 0;
+        }
+        if (operation == 1)
+        {
+            return RegisterProjectAsset(String(path));
+        }
+        if (operation == 3)
+        {
+            ImportProjectResources(String(path));
+            return 1;
+        }
+    }
+    catch (...)
+    {
+        ed_status("Project operation failed. Check the path and file permissions.");
+    }
+    return 0;
+}

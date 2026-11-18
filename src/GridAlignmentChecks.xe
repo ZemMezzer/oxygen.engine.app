@@ -1,0 +1,117 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+bool GridAligned(float value)
+{
+    return Abs(value - GridFloor(value * 0.5f + 0.5f) * 2.0f) < 0.001f;
+}
+
+int GridAlignmentChecks()
+{
+    int failures = RoundedFootprintChecks();
+    int asset = ed_asset_find("Tiles/tile_Regression/grid-wide.oxtile");
+    int face = ed_asset_find("Tiles/tile_Regression/legacy.oxtile");
+    if (asset == 0 || face == 0)
+    {
+        Log("FAIL: alignment fixtures missing.");
+        return 1;
+    }
+
+    // Two parallel 4x4 walls: authored bounds (-4, 0, -4) to (0, 4, 0).
+    for (int turn = 0; turn < 4; turn++)
+    {
+        Document doc = Document();
+        Vector3 origin = Vector3(1.0f, 0.0f, 1.0f);
+        if (turn > 0)
+        {
+            origin = Vector3(-5.0f, -4.0f, -5.0f);
+        }
+        float yaw = cast<float>(turn) * 90.0f;
+        int slot = doc.Add(6, origin, yaw, asset, 0);
+        if (slot < 0)
+        {
+            failures++;
+            continue;
+        }
+        Primitive placed = MakePrimitive(&doc.Data[0], slot);
+        Primitive preview = TilePlacement(asset, origin, yaw);
+        Bounds bounds = TileBounds(placed);
+        Bounds cells = TileCells(placed);
+        if (!GridAligned(bounds.Low.X) || !GridAligned(bounds.Low.Y) || !GridAligned(bounds.Low.Z) ||
+            !GridAligned(bounds.High.X) || !GridAligned(bounds.High.Y) || !GridAligned(bounds.High.Z) ||
+            cells.High.X - cells.Low.X != 2.0f || cells.High.Z - cells.Low.Z != 2.0f ||
+            Length(Subtract(preview.Transform.Position, placed.Transform.Position)) > 0.001f)
+        {
+            failures++;
+        }
+        Vector3 adjacent = Vector3(placed.Transform.Position.X + 4.0f, doc.Data[slot * Stride + 2],
+                                   placed.Transform.Position.Z);
+        int next = doc.Add(6, adjacent, yaw, asset, 0);
+        if (next < 0)
+        {
+            failures++;
+        }
+        else
+        {
+            Bounds nextBounds = TileBounds(MakePrimitive(&doc.Data[0], next));
+            if (Abs(bounds.High.X - nextBounds.Low.X) > 0.001f)
+            {
+                failures++;
+            }
+        }
+        doc.ResetHistory();
+        doc.Data[slot * Stride + 1] -= 1.2f;
+        if (!ConstrainTileChanges(&doc.Data[0], &doc.History[0]))
+        {
+            failures++;
+        }
+        Bounds moved = TileBounds(MakePrimitive(&doc.Data[0], slot));
+        if (!GridAligned(moved.Low.X))
+        {
+            failures++;
+        }
+        doc.Commit();
+        doc.Restore(0);
+        Primitive restored = MakePrimitive(&doc.Data[0], slot);
+        if (Length(Subtract(restored.Transform.Position, placed.Transform.Position)) > 0.001f)
+        {
+            failures++;
+        }
+    }
+
+    Document flat = Document();
+    int slot = flat.Add(6, Vector3(1.0f, 0.0f, 1.0f), 0.0f, face, 0);
+    Primitive planar = MakePrimitive(&flat.Data[0], slot);
+    Bounds cells = TileCells(planar);
+    if (!GridAligned(planar.Transform.Position.Z) || cells.High.Z - cells.Low.Z != 1.0f)
+    {
+        failures++;
+    }
+    // Scaling a volume preserves authored grid-aligned edges at whole-metre sizes.
+    flat.Data[slot * Stride + 8] = cast<float>(asset);
+    // Mixed even/odd cell counts and a non-square footprint.
+    for (int turn = 0; turn < 4; turn++)
+    {
+        flat.Data[slot * Stride + 5] = 4.0f;
+        flat.Data[slot * Stride + 6] = 2.0f;
+        flat.Data[slot * Stride + 7] = 6.0f;
+        flat.Data[slot * Stride + 4] = cast<float>(turn) * 90.0f;
+        SnapWorldTile(&flat.Data[0], slot);
+        Bounds bounds = TileBounds(MakePrimitive(&flat.Data[0], slot));
+        if (!GridAligned(bounds.Low.X) || !GridAligned(bounds.High.X) || !GridAligned(bounds.Low.Z) ||
+            !GridAligned(bounds.High.Z))
+        {
+            failures++;
+        }
+    }
+    if (failures == 0)
+    {
+        Log("PASS: 4m tile boundaries, rotated/negative placement, preview, flush neighbours, flat Faces and Undo.");
+    }
+    else
+    {
+        Log("FAIL: tile footprint grid alignment.");
+    }
+    return failures;
+}

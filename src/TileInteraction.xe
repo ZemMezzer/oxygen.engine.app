@@ -1,0 +1,222 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+extern void ed_bind_tile_interaction(function int(int, float *, float *, float *, float *, float *) *
+                                     callback);
+extern float ed_triangle_hit(float *ray, float *points);
+
+Vector3 TilePoint(float *data, int vertex)
+{
+    int at = vertex * 4;
+    return Vector3(data[at + 1], data[at + 2], data[at + 3]);
+}
+
+int PickTileElement(float *data, float *camera, float *input, float *output)
+{
+    int mode = cast<int>(input[2]);
+    int face = cast<int>(input[3]);
+    ScreenPoint mouse = ScreenPoint(input[0], input[1]);
+    int picked = -1;
+    if (mode == 1)
+    {
+        float nearest = 12.0f;
+        Vector3 position = Vector3(camera[0], camera[1], camera[2]);
+        Vector3 forward = Normalize(Subtract(Vector3(camera[3], camera[4], camera[5]), position));
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (data[i * 4] == 0.0f)
+            {
+                continue;
+            }
+            Vector3 p = TilePoint(data, i);
+            if (Dot(Subtract(p, position), forward) <= 0.0f)
+            {
+                continue;
+            }
+            float distance = ScreenDistance(ProjectGizmo(camera, p), mouse);
+            if (distance < nearest)
+            {
+                picked = i;
+                nearest = distance;
+            }
+        }
+    }
+    else
+    {
+        face = -1;
+        float nearest = 1e20f;
+        float[] ray = float[6];
+        float[] points = float[9];
+        ed_screen_ray(camera, mouse.X, mouse.Y, cast<int>(camera[12]), cast<int>(camera[13]), &ray[0]);
+        for (int i = 0; i < TileFaces; i++)
+        {
+            int at = TileFaceStart + i * TileFaceStride;
+            if (data[at] == 0.0f)
+            {
+                continue;
+            }
+            for (int triangle = 0; triangle < 2; triangle++)
+            {
+                for (int corner = 0; corner < 3; corner++)
+                {
+                    int offset = corner;
+                    if (triangle == 1 && corner > 0)
+                    {
+                        offset++;
+                    }
+                    Vector3 p = TilePoint(data, cast<int>(data[at + offset + 1]));
+                    points[corner * 3] = p.X;
+                    points[corner * 3 + 1] = p.Y;
+                    points[corner * 3 + 2] = p.Z;
+                }
+                float distance = ed_triangle_hit(&ray[0], &points[0]);
+                if (distance >= 0.0f && distance < nearest)
+                {
+                    face = i;
+                    nearest = distance;
+                }
+            }
+        }
+        if (face >= 0)
+        {
+            picked = cast<int>(data[TileFaceStart + face * TileFaceStride + 1]);
+        }
+    }
+    output[0] = cast<float>(picked);
+    output[1] = cast<float>(face);
+    return picked;
+}
+
+void ApplyTilePick(float *data, float *selection, float *input)
+{
+    int picked = cast<int>(input[0]);
+    int face = cast<int>(input[1]);
+    int mode = cast<int>(input[2]);
+    bool additive = input[3] != 0.0f;
+    if (!additive)
+    {
+        for (int i = 0; i < TileVertices; i++)
+        {
+            selection[i] = 0.0f;
+        }
+    }
+    if (picked < 0)
+    {
+        return;
+    }
+    if (mode == 1)
+    {
+        if (additive && selection[picked] != 0.0f)
+        {
+            selection[picked] = 0.0f;
+        }
+        else
+        {
+            selection[picked] = 1.0f;
+        }
+    }
+    else if (mode == 0)
+    {
+        for (int i = 0; i < TileVertices; i++)
+        {
+            selection[i] = data[i * 4];
+        }
+    }
+    else
+    {
+        for (int i = 1; i <= 4; i++)
+        {
+            selection[cast<int>(data[TileFaceStart + face * TileFaceStride + i])] = 1.0f;
+        }
+    }
+}
+
+void TilePreview(float *data, float *input, float *uv)
+{
+    for (int i = 0; i < TileDataSize; i++)
+    {
+        data[i] = 0.0f;
+    }
+    int plane = cast<int>(input[5]);
+    for (int i = 0; i < 4; i++)
+    {
+        float u = -input[3] * 0.5f;
+        if (i == 1 || i == 2)
+        {
+            u = -u;
+        }
+        float v = -input[4] * 0.5f;
+        if (i >= 2)
+        {
+            v = -v;
+        }
+        Vector3 p = Vector3(u, v, 0.0f);
+        if (plane == 1)
+        {
+            p = Vector3(u, 0.0f, -v);
+        }
+        if (plane == 2)
+        {
+            p = Vector3(0.0f, v, -u);
+        }
+        data[i * 4] = 1.0f;
+        data[i * 4 + 1] = input[0] + p.X;
+        data[i * 4 + 2] = input[1] + p.Y;
+        data[i * 4 + 3] = input[2] + p.Z;
+        data[TileFaceStart + 1 + i] = cast<float>(i);
+    }
+    data[TileFaceStart] = 1.0f;
+    for (int i = 0; i < 8; i++)
+    {
+        data[TileFaceStart + 5 + i] = uv[i];
+    }
+}
+
+int TrimTileFace(float *data, float *trim, float *input, float *values)
+{
+    int face = cast<int>(input[0]);
+    int at = TileFaceStart + face * TileFaceStride;
+    float width = ScreenDistance(ScreenPoint(data[at + 5] * input[1], data[at + 6] * input[2]),
+                                 ScreenPoint(data[at + 7] * input[1], data[at + 8] * input[2]));
+    float height = ScreenDistance(ScreenPoint(data[at + 5] * input[1], data[at + 6] * input[2]),
+                                  ScreenPoint(data[at + 11] * input[1], data[at + 12] * input[2]));
+    if (width <= 0.001f || height <= 0.001f || trim[0] < 0.0f || trim[1] < 0.0f || trim[2] < 0.0f ||
+        trim[3] < 0.0f || trim[0] + trim[1] >= width || trim[2] + trim[3] >= height)
+    {
+        ed_status("Trim margins must leave a non-empty Face.");
+        return 0;
+    }
+    values[0] = input[0];
+    values[1] = trim[0] / width;
+    values[2] = trim[2] / height;
+    values[3] = 1.0f - trim[1] / width;
+    values[4] = 1.0f - trim[3] / height;
+    return 22;
+}
+
+int TileInteractionDispatch(int operation, float *data, float *selection, float *camera, float *input,
+                            float *output)
+{
+    if (operation == 0)
+    {
+        return PickTileElement(data, camera, input, output);
+    }
+    if (operation == 1)
+    {
+        ApplyTilePick(data, selection, input);
+    }
+    if (operation == 2)
+    {
+        TilePreview(data, input, selection);
+    }
+    if (operation == 3)
+    {
+        return TrimTileFace(data, selection, input, output);
+    }
+    if (operation == 4)
+    {
+        UpdateTileCanvasSelection(data, selection, camera, input, output);
+    }
+    return 0;
+}

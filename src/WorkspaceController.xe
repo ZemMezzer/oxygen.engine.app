@@ -1,0 +1,80 @@
+using Xenon.Text;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+extern void ed_bind_workspace_controller(function int(int, int, float *, readonly byte *) * callback);
+extern void ed_panel_open(int index);
+extern void ed_layout_reset();
+extern void ed_window_title(readonly byte *title);
+
+int WorkspaceControllerDispatch(int operation, int argument, float *state, readonly byte *path)
+{
+    if (operation == 0)
+    {
+        if (argument >= 200 && argument < 206)
+        {
+            ed_panel_open(argument - 200);
+        }
+        else if (argument == 210)
+        {
+            ed_layout_reset();
+        }
+        else if (argument != 0)
+        {
+            InspectorDispatch(2, null, null, null);
+            QueueEditorCommand(argument);
+        }
+    }
+    if (operation == 1)
+    {
+        if (argument == 0 && state[6] != 0.0f)
+        {
+            QueueEditorCommand(6);
+        }
+        String scene = ProjectService.State->Scene;
+        String label = String("Untitled");
+        if (scene.ByteLength > 0)
+        {
+            label = String(Path.GetFileName(scene.AsView()));
+        }
+        String title = String("Oxygen - ") + String(Path.GetFileName(ProjectService.State->Root.AsView())) +
+                       String(" / ") + label;
+        if (state[5] != 0.0f)
+        {
+            title = title + String(" *");
+        }
+        ed_window_title(title.CString);
+    }
+    if (operation == 2 && state[6] == 0.0f)
+    {
+        ProjectDispatch(3, path, 0);
+    }
+    if (operation == 3)
+    {
+        int result = WorkspaceModelDispatch(3, 0, null, null, null);
+        WorkspaceModelDispatch(4, 0, null, null, null);
+        return result;
+    }
+    if (operation == 4)
+    {
+        return UiFlag(state[0] != 0.0f && state[1] != 0.0f && state[2] == 0.0f && state[3] == 0.0f &&
+                      state[4] == 0.0f && state[5] == 0.0f && state[6] == 0.0f);
+    }
+    if (operation == 5)
+    {
+        for (int i = 0; i < 6; i++)
+        {
+            if (state[i] != 0.0f)
+            {
+                return 1;
+            }
+        }
+    }
+    if (operation == 6)
+    {
+        return UiFlag(state[0] != 0.0f && state[1] != 0.0f && state[2] == 0.0f && state[3] == 0.0f &&
+                      state[4] == 0.0f && state[5] == 0.0f && state[6] == 0.0f && state[7] == 0.0f);
+    }
+    return 0;
+}

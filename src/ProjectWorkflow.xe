@@ -1,0 +1,235 @@
+using Oxygen;
+using Xenon.Text;
+using Xenon.IO;
+
+namespace OxygenEditor;
+
+extern void ed_bind_workflow(function int(int, readonly byte *, float *, int) * callback);
+extern readonly byte *ed_application_directory();
+extern readonly byte *ed_choose_dialog(int kind, readonly byte *title, readonly byte *initial);
+extern int ed_dialog_guard();
+extern void ed_scene_view(readonly byte *path);
+extern void ed_checker_image(readonly byte *path);
+extern void ed_export_wave(short *samples, int count, int rate, readonly byte *path);
+extern readonly byte *getenv(readonly byte *name);
+extern int ed_tile_guard();
+
+String ChooseEditorFile(bool save, bool scene)
+{
+    int kind = 1;
+    if (save)
+    {
+        kind = 2;
+    }
+    if (scene)
+    {
+        kind += 2;
+    }
+    return String(ed_choose_dialog(kind, "", ProjectService.State->Root.CString));
+}
+
+void SeedProjectResources()
+{
+    String materials = AssetFile(String("Materials"));
+    String props = AssetFile(String("Props"));
+    String sounds = AssetFile(String("Sounds"));
+    ed_fs_create_directories(materials.CString);
+    ed_fs_create_directories(props.CString);
+    ed_fs_create_directories(sounds.CString);
+    String stone = JoinPath(materials, String("Stone.png"));
+    if (!File.Exists(stone))
+    {
+        ed_checker_image(stone.CString);
+    }
+    String crate = JoinPath(props, String("Crate.obj"));
+    if (!File.Exists(crate))
+    {
+        File.WriteAllText(
+            crate,
+            String(
+                "# Oxygen original sample prop\nmtllib Crate.mtl\no Crate\nv -0.5 0 -0.5\nv 0.5 0 -0.5\nv 0.5 1 -0.5\nv -0.5 1 -0.5\nv -0.5 0 0.5\nv 0.5 0 0.5\nv 0.5 1 0.5\nv -0.5 1 0.5\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\nvn 0 0 -1\nvn 0 0 1\nvn -1 0 0\nvn 1 0 0\nvn 0 1 0\nvn 0 -1 0\nusemtl Wood\nf 4/4/1 3/3/1 2/2/1 1/1/1\nf 5/1/2 6/2/2 7/3/2 8/4/2\nf 1/1/3 5/2/3 8/3/3 4/4/3\nf 2/1/4 3/4/4 7/3/4 6/2/4\nf 4/1/5 8/2/5 7/3/5 3/4/5\nf 1/1/6 2/2/6 6/3/6 5/4/6\n"));
+        File.WriteAllText(JoinPath(props, String("Crate.mtl")), String("newmtl Wood\nKd 0.72 0.46 0.24\n"));
+    }
+    String chime = JoinPath(sounds, String("Chime.wav"));
+    if (!File.Exists(chime))
+    {
+        unique<short[]> samples = new short[22050];
+        for (int i = 0; i < 22050; i++)
+        {
+            float time = cast<float>(i) / 22050.0f;
+            samples[i] = cast<short>(Sin(time * 440.0f * 2.0f * Pi) * expf(-time * 6.0f) * 7000.0f);
+        }
+        ed_export_wave(&samples[0], 22050, 22050, chime.CString);
+    }
+    ScanProjectAssets();
+}
+
+int SaveEditorScene(readonly String &path, float *records, int count)
+{
+    if (path.ByteLength == 0)
+    {
+        return 0;
+    }
+    if (SceneDispatch(0, path.CString, records, count) == 0)
+    {
+        ed_status("Save failed; previous scene retained.");
+        return 0;
+    }
+    ProjectService.State->Scene = path;
+    ed_scene_view(path.CString);
+    ed_status((String("Saved ") + String(Path.GetFileName(path.AsView()))).CString);
+    return 1;
+}
+
+int LoadEditorScene(readonly String &path, float *records, int count)
+{
+    if (path.ByteLength == 0 || SceneDispatch(1, path.CString, records, count) == 0)
+    {
+        return 0;
+    }
+    ProjectService.State->Scene = path;
+    ed_scene_view(path.CString);
+    ed_status((String("Loaded ") + String(Path.GetFileName(path.AsView()))).CString);
+    return 1;
+}
+
+int WorkflowDispatch(int operation, readonly byte *path, float *records, int argument)
+{
+    try
+    {
+        if (operation == 0)
+        {
+            readonly byte *configured = getenv("OXYGEN_EDITOR_PROJECT");
+            String initial =
+                JoinPath(String(ed_application_directory()), String("../../../Projects/Starter"));
+            if (configured != null)
+            {
+                initial = String(configured);
+            }
+            bool fresh = !File.Exists(JoinPath(initial, String("oxygen.project")));
+            if (!OpenEditorProject(initial, true))
+            {
+                return 0;
+            }
+            if (fresh)
+            {
+                try
+                {
+                    SeedProjectResources();
+                }
+                catch (...)
+                {
+                    ed_status("Sample resources could not be generated.");
+                }
+            }
+            return 1;
+        }
+        if (operation == 2 || operation == 3)
+        {
+            String file = ProjectService.State->Scene;
+            if (operation == 3)
+            {
+                file = ChooseEditorFile(true, true);
+            }
+            else if (file.ByteLength == 0)
+            {
+                if (Option("OXYGEN_EDITOR_SMOKE") != 0)
+                {
+                    file = JoinPath(ProjectService.State->Root, String("Scenes/Main.oxmap"));
+                }
+                else
+                {
+                    file = ChooseEditorFile(true, true);
+                }
+            }
+            return SaveEditorScene(file, records, argument);
+        }
+        if (operation == 4)
+        {
+            String file = ProjectService.State->Scene;
+            if (path == null)
+            {
+                file = ChooseEditorFile(false, true);
+            }
+            if (file.ByteLength == 0)
+            {
+                return 0;
+            }
+            if (LoadEditorScene(file, records, argument) != 0)
+            {
+                return 1;
+            }
+            if (File.Exists(file))
+            {
+                ed_status("Scene rejected: invalid or unsupported data. Current scene kept.");
+            }
+            return 0;
+        }
+        if (operation == 5)
+        {
+            ProjectService.State->Scene = String();
+            ed_scene_view("");
+            LayerService.Layers->Clear();
+            ed_layer_add("Layer 1");
+            ed_status("New scene.");
+            return 1;
+        }
+        if (operation == 6)
+        {
+            readonly byte *title = "Open Oxygen project";
+            if (argument != 0)
+            {
+                title = "New Oxygen project folder";
+            }
+            String folder = String(ed_choose_dialog(0, title, ""));
+            if (OpenEditorProject(folder, argument != 0))
+            {
+                return 1;
+            }
+            return 0;
+        }
+        if (operation == 7)
+        {
+            String resource = String();
+            if (argument != 0)
+            {
+                resource =
+                    String(ed_choose_dialog(0, "Import resource folder (keeps OBJ / glTF dependencies)", ""));
+            }
+            else
+            {
+                resource = ChooseEditorFile(false, false);
+            }
+            if (resource.ByteLength > 0)
+            {
+                ImportProjectResources(resource);
+            }
+            return 1;
+        }
+        if (operation == 8)
+        {
+            return SaveEditorScene(String(path), records, argument);
+        }
+        if (operation == 9)
+        {
+            return LoadEditorScene(String(path), records, argument);
+        }
+        if (operation == 10)
+        {
+            if (ed_tile_guard() == 0)
+            {
+                return 0;
+            }
+            if (argument == 0 || Option("OXYGEN_EDITOR_SMOKE") != 0)
+            {
+                return 1;
+            }
+            return ed_dialog_guard();
+        }
+    }
+    catch (...)
+    {
+        ed_status("Project operation failed. Check the file and destination.");
+    }
+    return 0;
+}

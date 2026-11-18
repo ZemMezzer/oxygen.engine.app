@@ -1,0 +1,128 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int LayerProtectionChecks()
+{
+    int failures = 0;
+    int initial = ed_layers_snapshot(0);
+    Document doc = Document();
+    int source = ed_layer_add("Protected objects");
+    int target = ed_layer_add("Editable objects");
+    doc.ActiveLayer = target;
+    int parent = doc.Add(2, Vector3(1.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    doc.ActiveLayer = source;
+    int child = doc.Add(2, Vector3(5.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    doc.Reparent(child, parent);
+    doc.ResetHistory();
+    ed_layer_set_flags(source, 2);
+    doc.Commit();
+    doc.Remove(parent);
+    doc.Remove(child);
+    if (doc.Count() != 2 || doc.CanEditTree(parent) || doc.Duplicate(parent) >= 0 ||
+        doc.Duplicate(child) >= 0 || doc.Reparent(child, -1) || doc.Reparent(parent, child) ||
+        doc.Add(2, Vector3(9.0f, 0.0f, 1.0f), 0.0f, 0, 0) >= 0 || doc.RemoveLayer(source, target) ||
+        doc.RemoveLayer(target, -1))
+    {
+        Log("FAIL: layer protection must reject edits and indirect subtree changes.");
+        failures++;
+    }
+    float[] before = new float[RecordSize];
+    for (int i = 0; i < RecordSize; i++)
+    {
+        before[i] = doc.Data[i];
+    }
+    doc.Data[parent * Stride + 1] += 4.0f;
+    doc.FollowTransform(&before[0], parent);
+    if (doc.Data[parent * Stride + 1] != before[parent * Stride + 1] ||
+        doc.Data[child * Stride + 1] != before[child * Stride + 1])
+    {
+        failures++;
+    }
+    delete (before);
+    doc.Restore(0);
+    if (!doc.CanEditTree(parent))
+    {
+        failures++;
+    }
+    doc.Restore(1);
+    if (doc.CanEditTree(parent) || ed_layer_visible(source) == 0)
+    {
+        failures++;
+    }
+    ed_layer_set_flags(source, 1);
+    doc.Remove(child);
+    if (doc.CanEdit(child) || doc.Count() != 2 || ed_layer_visible(source) != 0)
+    {
+        failures++;
+    }
+    ed_layer_set_flags(source, 0);
+    if (!doc.Reparent(child, -1) || doc.Duplicate(child) < 0)
+    {
+        failures++;
+    }
+    doc.Remove(child);
+    if (doc.Count() != 2)
+    {
+        failures++;
+    }
+    // Test the actual editor commands as well as the document operations.
+    Editor editor = Editor();
+    for (int i = 0; i < RecordSize; i++)
+    {
+        editor.Document.Data[i] = 0.0f;
+    }
+    int layer = ed_layer_add("Editor protected layer");
+    editor.Document.ActiveLayer = layer;
+    editor.WorldLayer = layer;
+    int object = editor.Document.Add(2, Vector3(1.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    editor.Selected = object;
+    editor.Document.ResetHistory();
+    ed_layer_set_flags(layer, 2);
+    editor.Action(51);
+    editor.Action(50);
+    editor.Action(91);
+    editor.Action(6000);
+    editor.Brush = 2;
+    editor.PaintCell(Vector3(5.0f, 0.0f, 1.0f));
+    if (editor.Document.Count() != 1 || editor.Document.Cursor != 0 ||
+        editor.Document.Data[object * Stride + 1] != 1.0f ||
+        editor.Document.Data[object * Stride + 15] != cast<float>(layer) || !editor.LayerVisible(layer))
+    {
+        Log("FAIL: locked layer must block editor commands and painting while remaining visible.");
+        failures++;
+    }
+    editor.Ray[0] = 1.0f;
+    editor.Ray[1] = 1.0f;
+    editor.Ray[2] = 5.0f;
+    editor.Ray[3] = 0.0f;
+    editor.Ray[4] = 0.0f;
+    editor.Ray[5] = -1.0f;
+    if (editor.Pick() >= 0)
+    {
+        failures++;
+    }
+    ed_layer_set_flags(layer, 1);
+    if (editor.LayerVisible(layer) || editor.Pick() >= 0)
+    {
+        failures++;
+    }
+    ed_layer_set_flags(layer, 0);
+    if (!editor.LayerVisible(layer) || editor.Pick() != object)
+    {
+        failures++;
+    }
+    editor.Action(51);
+    if (editor.Document.Data[object * Stride + 1] == 1.0f)
+    {
+        failures++;
+    }
+    editor.Document.Dirty = false;
+    ed_layers_restore(initial);
+    ed_layers_release(initial);
+    if (failures == 0)
+    {
+        Log("PASS: layer lock/hide blocks add/delete/duplicate/reparent and parent transforms, with Undo/Redo and unlock.");
+    }
+    return failures;
+}

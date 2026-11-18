@@ -1,0 +1,28 @@
+namespace OxygenEditor;
+
+extern void ed_bind_menu_policy(function int(int, int, int, int, int) * callback);
+
+int EditorMenuEnabled(int action, int playing, int selected, int undo, int redo)
+{
+    if (action == 6 || action == 99 || action >= 200)
+    {
+        return 1;
+    }
+    if (playing != 0)
+    {
+        return 0;
+    }
+    if (action == 7)
+    {
+        return undo;
+    }
+    if (action == 8)
+    {
+        return redo;
+    }
+    if (action == 50 || action == 64 || action == 91)
+    {
+        return selected;
+    }
+    return 1;
+}

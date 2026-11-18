@@ -1,0 +1,155 @@
+using Oxygen;
+using Xenon.Collections;
+using Xenon.Text;
+
+namespace OxygenEditor;
+
+static struct WorkspaceService
+{
+    public static Vector<int> *Commands;
+}
+
+extern void ed_bind_workspace_model(function int(int, int, float *, float *, byte *) * callback);
+
+bool EditableObjectTree(float *records, int root)
+{
+    if (root < 0 || root >= Capacity || records[root * Stride] == 0.0f ||
+        ed_layer_editable(cast<int>(records[root * Stride + 15])) == 0)
+    {
+        return false;
+    }
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (records[i * Stride] == 0.0f || ed_layer_editable(cast<int>(records[i * Stride + 15])) != 0)
+        {
+            continue;
+        }
+        int parent = i;
+        for (int depth = 0; depth < 64 && parent >= 0 && parent < Capacity; depth++)
+        {
+            if (parent == root)
+            {
+                return false;
+            }
+            parent = cast<int>(records[parent * Stride + 14]) - 1;
+        }
+    }
+    return true;
+}
+
+bool ValidInspectorTransform(float *values)
+{
+    for (int i = 0; i < 9; i++)
+    {
+        float value = values[i];
+        if (value != value || Abs(value) > 3.402823466e38f || (i >= 3 && i < 6 && Abs(value) > 36000.0f) ||
+            (i >= 6 && (value < 0.02f || value > 1000.0f)))
+        {
+            ed_status("Invalid transform: finite position, rotation +/-36000, size 0.02..1000.");
+            return false;
+        }
+    }
+    return true;
+}
+
+int WorkspaceModelDispatch(int operation, int argument, float *records, float *output, byte *text)
+{
+    Vector<int> *commands = WorkspaceService.Commands;
+    if (operation == 0)
+    {
+        commands->Add(argument);
+    }
+    if (operation == 1)
+    {
+        commands->Insert(0, argument);
+    }
+    if (operation == 2)
+    {
+        return commands->Count;
+    }
+    if (operation == 3)
+    {
+        if (commands->Count == 0)
+        {
+            return 0;
+        }
+        return *commands->Get(0);
+    }
+    if (operation == 4 && commands->Count > 0)
+    {
+        commands->RemoveAt(0);
+    }
+    if (operation == 5)
+    {
+        commands->Clear();
+    }
+    if (operation == 6)
+    {
+        if (EditableObjectTree(records, argument))
+        {
+            return 1;
+        }
+        return 0;
+    }
+    if (operation == 7)
+    {
+        for (int i = 0; i < Capacity; i++)
+        {
+            output[i] = 0.0f;
+            output[Capacity + i] = -2.0f;
+        }
+        int ancestor = argument;
+        for (int depth = 0; depth < 64 && ancestor >= 0 && ancestor < Capacity; depth++)
+        {
+            ancestor = cast<int>(records[ancestor * Stride + 14]) - 1;
+            if (ancestor >= 0 && ancestor < Capacity)
+            {
+                output[ancestor] = 1.0f;
+            }
+        }
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (records[i * Stride] != 0.0f)
+            {
+                output[Capacity + i] = records[i * Stride + 14] - 1.0f;
+            }
+        }
+    }
+    if (operation == 8)
+    {
+        if (ValidInspectorTransform(records))
+        {
+            return 1;
+        }
+        return 0;
+    }
+    if (operation == 9)
+    {
+        int number = ed_layer_count() + 1;
+        while (true)
+        {
+            StringBuilder name = StringBuilder();
+            name.Append("Layer ");
+            name.Append(number++);
+            String value = name.ToString();
+            if (ValidLayerName(value, -1))
+            {
+                CopyText(text, value);
+                break;
+            }
+        }
+    }
+    if (operation == 10)
+    {
+        int count = 0;
+        for (int i = 0; i < Capacity; i++)
+        {
+            if (records[i * Stride] != 0.0f && cast<int>(records[i * Stride + 15]) == argument)
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+    return 0;
+}

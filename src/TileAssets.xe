@@ -1,0 +1,200 @@
+using Xenon.Text;
+using Xenon.IO;
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+extern void ed_bind_tile_assets(function int(int, readonly byte *, readonly byte *, readonly byte *,
+                                             readonly byte *, float *) *
+                                callback);
+extern void ed_tile_catalog_view(int operation, readonly byte *path, readonly byte *name,
+                                 readonly byte *tileset);
+extern void ed_tile_saved_view(readonly byte *path, int id);
+extern void ed_tile_error_view(readonly byte *text);
+extern int ed_native_guard();
+
+String TileFileStem(readonly String &name)
+{
+    StringBuilder result = StringBuilder();
+    result.Append(StringView("tile_"));
+    int accepted = 0;
+    for (int i = 0; i < name.ByteLength; i++)
+    {
+        int c = cast<int>(name.CString[i]);
+        if ((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 95)
+        {
+            result.Append(cast<char>(c));
+            accepted++;
+        }
+        else if (c == 32)
+        {
+            result.Append(cast<char>(95));
+            accepted++;
+        }
+    }
+    if (accepted == 0)
+    {
+        result.Append(StringView("Tile"));
+    }
+    return result.ToString();
+}
+
+void ScanTileCatalog(readonly String &selectedSet)
+{
+    ed_tile_catalog_view(0, "", "", "");
+    String directory = AssetFile(String("Tiles"));
+    ed_fs_create_directories(directory.CString);
+    Vector<FileEntry> entries = ListFiles(directory, false);
+    Vector<String> sets = Vector<String>();
+    for (int i = 0; i < entries.Count; i++)
+    {
+        FileEntry *entry = entries.Get(i);
+        if (entry->Kind == 2 && File.Exists(JoinPath(entry->Path, String("tileset.oxtileset"))))
+        {
+            sets.Add(NativePath(2, entry->Path, AssetRoot()));
+        }
+    }
+    SortPaths(&sets, 0, sets.Count - 1);
+    bool selectedFound = false;
+    int first = -1;
+    for (int i = 0; i < sets.Count; i++)
+    {
+        try
+        {
+            String path = *sets.Get(i);
+            TileSetDocument document = ReadTileSet(path);
+            if (first < 0)
+            {
+                first = i;
+            }
+            if (path.Equals(selectedSet))
+            {
+                selectedFound = true;
+            }
+            ed_tile_catalog_view(1, path.CString, document.Name.CString, "");
+            SortPaths(&document.Members, 0, document.Members.Count - 1);
+            unique<float[]> data = new float[TileDataSize];
+            for (int j = 0; j < document.Members.Count; j++)
+            {
+                String member = *document.Members.Get(j);
+                TileMetadata meta = TileMetadata();
+                if (ReadTileFile(AssetFile(member), &data[0], &meta))
+                {
+                    ed_tile_catalog_view(2, member.CString, meta.Name.CString, path.CString);
+                }
+            }
+        }
+        catch (...)
+        {
+        }
+    }
+    if (!selectedFound)
+    {
+        if (first >= 0)
+        {
+            ed_tileset_view(2, sets.Get(first)->CString);
+        }
+        else
+        {
+            ed_tileset_view(2, "");
+        }
+    }
+}
+
+bool SaveEditorTile(readonly String &tileset, readonly String &file, readonly String &name,
+                    readonly String &texture, float *data)
+{
+    if (data == null || (tileset.ByteLength == 0 && file.ByteLength == 0) || name.ByteLength == 0 ||
+        !ValidTile(data))
+    {
+        ed_status("Choose a tileset and a tile name before saving.");
+        return false;
+    }
+    bool fresh = file.ByteLength == 0;
+    String relative = file;
+    if (fresh)
+    {
+        relative = JoinPath(tileset, TileFileStem(name) + String(".oxtile"));
+        if (File.Exists(AssetFile(relative)))
+        {
+            ed_status("A tile with this filename already exists. Choose another name.");
+            return false;
+        }
+    }
+    TileMetadata meta = TileMetadata();
+    meta.Name = name;
+    meta.Texture = texture;
+    if (!ExportTileMesh(relative, data, meta))
+    {
+        ed_status("Cannot write tile mesh cache. Check its texture and destination.");
+        return false;
+    }
+    if (!WriteTileFile(AssetFile(relative), data, meta))
+    {
+        return false;
+    }
+    if (fresh)
+    {
+        readonly byte *pointer = relative.CString;
+        if (!ChangeTileSet(tileset, 1, &pointer, true, false))
+        {
+            ed_status("Tile saved, but it could not be added to the tileset.");
+            return false;
+        }
+    }
+    ed_tile_saved_view(relative.CString, RegisterProjectAsset(relative));
+    ed_status((String("Saved tile: ") + relative).CString);
+    return true;
+}
+
+int TileAssetsDispatch(int operation, readonly byte *tileset, readonly byte *file, readonly byte *name,
+                       readonly byte *texture, float *data)
+{
+    try
+    {
+        if (operation == 3)
+        {
+            return LoadTileRuntimeModel(String(file));
+        }
+        if (operation == 0)
+        {
+            if (SaveEditorTile(String(tileset), String(file), String(name), String(texture), data))
+            {
+                return 1;
+            }
+            return 0;
+        }
+        if (operation == 1)
+        {
+            ScanTileCatalog(String(tileset));
+            return 1;
+        }
+        if (operation == 2)
+        {
+            String path = JoinPath(String("Tiles"), TileFileStem(String(name)));
+            if (Directory.Exists(AssetFile(path)))
+            {
+                ed_tile_error_view("This tileset already exists.");
+                return 0;
+            }
+            if (ed_fs_create_directories(AssetFile(path).CString) == 0)
+            {
+                throw 1;
+            }
+            TileSetDocument document = TileSetDocument();
+            document.Name = String(name);
+            if (!WriteTileSet(path, &document))
+            {
+                throw 1;
+            }
+            ed_tileset_view(2, path.CString);
+            return 1;
+        }
+    }
+    catch (...)
+    {
+        ed_tile_error_view("Cannot update tile assets. Check the file and destination.");
+        ed_status("Cannot update tile assets. Check the file and destination.");
+    }
+    return 0;
+}

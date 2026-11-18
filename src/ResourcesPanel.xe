@@ -1,0 +1,195 @@
+using Oxygen;
+using Xenon.Text;
+using Xenon.IO;
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+extern void ed_bind_resources(function void(float *) * callback);
+extern void ed_assets_refresh_view();
+extern void ed_asset_selected_view(int id);
+extern void ed_asset_preview(int id);
+extern void ed_tile_resource_request(int id);
+extern void ui_child_begin(readonly byte *label, float width, float height, int border);
+extern void ui_child_end();
+extern float ui_available_width();
+extern int ui_card_button(readonly byte *label, float width, float height, int selected);
+extern void ui_text_wrapped(readonly byte *text);
+
+readonly byte *AssetTypeName(int kind)
+{
+    if (kind == 1)
+    {
+        return "Texture";
+    }
+    if (kind == 2)
+    {
+        return "Model";
+    }
+    if (kind == 3)
+    {
+        return "Audio";
+    }
+    if (kind == 5)
+    {
+        return "Tile";
+    }
+    return "File";
+}
+
+struct ResourcesPanel
+{
+    public String Folder;
+
+    public ResourcesPanel()
+    {
+        Folder = String();
+    }
+
+    public void TileItem(int id, int kind)
+    {
+        if (kind != 5)
+        {
+            return;
+        }
+        if (ui_item_query(7) != 0)
+        {
+            ed_tile_resource_request(id);
+        }
+        ui_drag_source("OXYGEN_TILE_ASSET", id, "Tile");
+    }
+
+    public void Draw(float *state)
+    {
+        ui_disabled_begin(UiFlag(state[6] != 0.0f));
+        if (UiButton("Import file"))
+        {
+            QueueEditorCommand(9);
+        }
+        ui_same_line();
+        if (UiButton("Import folder"))
+        {
+            QueueEditorCommand(10);
+        }
+        ui_same_line();
+        if (UiButton("Refresh"))
+        {
+            ed_assets_refresh_view();
+            ScanProjectAssets();
+            ed_status("Resources refreshed.");
+        }
+        ui_same_line();
+        if (UiButton("Up") && Folder.ByteLength > 0)
+        {
+            Folder = String(Path.GetDirectoryName(Folder.AsView()));
+        }
+        ui_text_disabled((String("Assets / ") + Folder).CString);
+        ui_separator();
+        ui_child_begin("Files", Max(120.0f, ui_available_width() - 235.0f), 0.0f, 1);
+        Vector<String> folders = Vector<String>();
+        Vector<EditorAsset> *assets = &ProjectService.State->Assets;
+        String basePath = Folder;
+        if (basePath.ByteLength == 0)
+        {
+            basePath = String(".");
+        }
+        for (int i = 0; i < assets->Count; i++)
+        {
+            String relative = NativePath(2, assets->Get(i)->Path, basePath);
+            if (!SafeAssetPath(relative))
+            {
+                continue;
+            }
+            int separator = -1;
+            for (int j = 0; j < relative.ByteLength; j++)
+            {
+                int c = cast<int>(relative.CString[j]);
+                if (c == 47 || c == 92)
+                {
+                    separator = j;
+                    break;
+                }
+            }
+            if (separator < 0)
+            {
+                continue;
+            }
+            String child = JoinPath(Folder, String(relative.CString, separator));
+            bool found = false;
+            for (int j = 0; j < folders.Count; j++)
+            {
+                if (folders.Get(j)->Equals(child))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+            {
+                folders.Add(child);
+            }
+        }
+        int columns = cast<int>(Max(1.0f, ui_available_width() / 130.0f));
+        if (ui_table_begin("Cards", columns, 2) != 0)
+        {
+            for (int i = 0; i < folders.Count; i++)
+            {
+                String folder = *folders.Get(i);
+                ui_table_next();
+                String label = String("[Folder]\n") + String(Path.GetFileName(folder.AsView()));
+                if (ui_button(label.CString, -1.0f, 68.0f) != 0)
+                {
+                    Folder = folder;
+                    break;
+                }
+            }
+            for (int i = 0; i < assets->Count; i++)
+            {
+                EditorAsset *asset = assets->Get(i);
+                if (!String(Path.GetDirectoryName(asset->Path.AsView())).Equals(Folder))
+                {
+                    continue;
+                }
+                int id = i + 1;
+                ui_table_next();
+                ui_push_id(id);
+                if (ui_card_button(AssetTypeName(asset->Kind), -1.0f, 43.0f, UiFlag(id == ed_asset_id())) !=
+                    0)
+                {
+                    ed_asset_selected_view(id);
+                    QueueEditorCommand(71);
+                }
+                TileItem(id, asset->Kind);
+                ui_text_wrapped(String(Path.GetFileName(asset->Path.AsView())).CString);
+                TileItem(id, asset->Kind);
+                ui_pop_id();
+            }
+            ui_table_end();
+        }
+        ui_child_end();
+        ui_same_line();
+        ui_child_begin("Preview", 0.0f, 0.0f, 0);
+        int selected = ed_asset_id();
+        if (selected > 0 && selected <= assets->Count)
+        {
+            EditorAsset *asset = assets->Get(selected - 1);
+            ui_text_wrapped(asset->Path.CString);
+            ed_asset_preview(selected);
+            if (asset->Kind == 3 && UiButton("Preview audio"))
+            {
+                QueueEditorCommand(12);
+            }
+        }
+        else
+        {
+            ui_text_wrapped("Import resources or drop files into the main editor window.");
+        }
+        ui_child_end();
+        ui_disabled_end();
+    }
+}
+
+static struct ResourcePanelService
+{
+    public static ResourcesPanel *Panel;
+}

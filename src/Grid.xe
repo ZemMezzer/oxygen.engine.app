@@ -1,0 +1,184 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+float GridFloor(float value)
+{
+    return ed_grid_floor(value);
+}
+
+bool IsWorldTile(float *data, int slot)
+{
+    if (slot < 0 || slot >= Capacity)
+    {
+        return false;
+    }
+    int at = slot * Stride;
+    return data[at] == 6.0f && ed_asset_kind(cast<int>(data[at + 8])) == 5;
+}
+
+// World-space footprint, with the collider minimum thickness removed for flat Faces.
+Bounds TileBounds(Primitive value)
+{
+    Vector3 extent = value.Size;
+    if (extent.X <= 0.020001f)
+    {
+        extent.X = 0.0f;
+    }
+    if (extent.Y <= 0.020001f)
+    {
+        extent.Y = 0.0f;
+    }
+    if (extent.Z <= 0.020001f)
+    {
+        extent.Z = 0.0f;
+    }
+    Vector3 low = Add(value.Transform.Position, Rotate(value.Transform.Rotation, Scale(extent, -0.5f)));
+    Vector3 high = low;
+    for (int i = 0; i < 8; i++)
+    {
+        Vector3 corner = Scale(extent, -0.5f);
+        if ((i & 1) != 0)
+        {
+            corner.X = -corner.X;
+        }
+        if ((i & 2) != 0)
+        {
+            corner.Y = -corner.Y;
+        }
+        if ((i & 4) != 0)
+        {
+            corner.Z = -corner.Z;
+        }
+        corner = Add(value.Transform.Position, Rotate(value.Transform.Rotation, corner));
+        low = Vector3(Min(low.X, corner.X), Min(low.Y, corner.Y), Min(low.Z, corner.Z));
+        high = Vector3(Max(high.X, corner.X), Max(high.Y, corner.Y), Max(high.Z, corner.Z));
+    }
+    return Bounds(low, high);
+}
+
+// Quantize around the geometry in world space. Padding never moves the mesh.
+// The authored tile origin is snapped separately, preserving its local grid.
+Bounds TileCells(Primitive value)
+{
+    Bounds geometry = TileBounds(value);
+    Vector3 low = geometry.Low;
+    Vector3 high = geometry.High;
+    low = Vector3(GridFloor((low.X + 0.001f) * 0.5f), GridFloor((low.Y + 0.001f) * 0.5f),
+                  GridFloor((low.Z + 0.001f) * 0.5f));
+    high = Vector3(-GridFloor((-high.X + 0.001f) * 0.5f), -GridFloor((-high.Y + 0.001f) * 0.5f),
+                   -GridFloor((-high.Z + 0.001f) * 0.5f));
+    high = Vector3(Max(high.X, low.X + 1.0f), Max(high.Y, low.Y + 1.0f), Max(high.Z, low.Z + 1.0f));
+    return Bounds(low, high);
+}
+
+Bounds TileFootprint(Primitive value)
+{
+    Bounds cells = TileCells(value);
+    return Bounds(Scale(cells.Low, 2.0f), Scale(cells.High, 2.0f));
+}
+
+Vector3 TileAuthoredOrigin(Primitive value, int asset)
+{
+    Bounds mesh = ModelBounds(ed_asset_handle(asset));
+    Vector3 extent = Subtract(mesh.High, mesh.Low);
+    Vector3 center = Scale(Add(mesh.Low, mesh.High), 0.5f);
+    center = Vector3(center.X * value.Size.X / Max(0.02f, extent.X),
+                     center.Y * value.Size.Y / Max(0.02f, extent.Y),
+                     center.Z * value.Size.Z / Max(0.02f, extent.Z));
+    return Subtract(value.Transform.Position, Rotate(value.Transform.Rotation, center));
+}
+
+Vector3 TileSnapOffset(Primitive value, int asset)
+{
+    Vector3 origin = TileAuthoredOrigin(value, asset);
+    Vector3 aligned =
+        Vector3(GridFloor(origin.X * 0.5f + 0.5f) * 2.0f, GridFloor(origin.Y * 0.5f + 0.5f) * 2.0f,
+                GridFloor(origin.Z * 0.5f + 0.5f) * 2.0f);
+    return Subtract(aligned, origin);
+}
+
+Primitive TilePlacement(int asset, Vector3 origin, float yaw)
+{
+    Bounds bounds = ModelBounds(ed_asset_handle(asset));
+    Vector3 size = Subtract(bounds.High, bounds.Low);
+    size = Vector3(Max(0.02f, size.X), Max(0.02f, size.Y), Max(0.02f, size.Z));
+    Primitive result =
+        Primitive(ShapeBox, Add(origin, Vector3(0.0f, size.Y * 0.5f, 0.0f)), size, Surface(0xFFFFFFFFu));
+    result.Transform.Rotation = RotationEuler(Vector3(0.0f, yaw * Pi / 180.0f, 0.0f));
+    result.Transform.Position = Add(result.Transform.Position, TileSnapOffset(result, asset));
+    return result;
+}
+
+void SnapWorldTile(float *data, int slot)
+{
+    if (!IsWorldTile(data, slot))
+    {
+        return;
+    }
+    int at = slot * Stride;
+    Primitive value = MakePrimitive(data, slot);
+    Vector3 center = Add(value.Transform.Position, TileSnapOffset(value, cast<int>(data[at + 8])));
+    data[at + 1] = center.X;
+    data[at + 2] = center.Y - value.Size.Y * 0.5f;
+    data[at + 3] = center.Z;
+    data[at + 10] = 0.0f;
+}
+
+bool TileSpaceFree(float *data, Bounds cells, int layer, int ignored)
+{
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (i != ignored && IsWorldTile(data, i) && cast<int>(data[i * Stride + 15]) == layer &&
+            Overlaps(cells, TileCells(MakePrimitive(data, i))))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ConstrainTileChanges(float *data, float *before)
+{
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (!IsWorldTile(data, i))
+        {
+            continue;
+        }
+        bool changed = false;
+        for (int j = 0; j < Stride; j++)
+        {
+            if (data[i * Stride + j] != before[i * Stride + j])
+            {
+                changed = true;
+            }
+        }
+        if (!changed)
+        {
+            continue;
+        }
+        SnapWorldTile(data, i);
+    }
+    for (int i = 0; i < Capacity; i++)
+    {
+        if (!IsWorldTile(data, i))
+        {
+            continue;
+        }
+        bool changed = false;
+        for (int j = 0; j < Stride; j++)
+        {
+            if (data[i * Stride + j] != before[i * Stride + j])
+            {
+                changed = true;
+            }
+        }
+        if (changed &&
+            !TileSpaceFree(data, TileCells(MakePrimitive(data, i)), cast<int>(data[i * Stride + 15]), i))
+        {
+            return false;
+        }
+    }
+    return true;
+}

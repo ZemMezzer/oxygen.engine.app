@@ -3,6 +3,12 @@
 #include <cstdio>
 #include <cstring>
 
+using EditorMenuPolicy = int (*)(int, int, int, int, int);
+static EditorMenuPolicy menuPolicy = nullptr;
+extern "C" __attribute__((visibility("default"))) void ed_bind_menu_policy(EditorMenuPolicy callback)
+{
+    menuPolicy = callback;
+}
 static int pendingCommand = 0;
 static bool playing = false, selected = false, canUndo = false, canRedo = false;
 @interface OxygenMenuTarget : NSObject <NSMenuItemValidation>
@@ -15,24 +21,7 @@ static bool playing = false, selected = false, canUndo = false, canRedo = false;
 }
 - (BOOL)validateMenuItem:(NSMenuItem *)item
 {
-    int action = (int)item.tag;
-    if (action == 7)
-    {
-        return !playing && canUndo;
-    }
-    if (action == 8)
-    {
-        return !playing && canRedo;
-    }
-    if (action == 50 || action == 64 || action == 91)
-    {
-        return !playing && selected;
-    }
-    if (action >= 200 || action == 99 || action == 6)
-    {
-        return YES;
-    }
-    return !playing;
+    return menuPolicy((int)item.tag, playing, selected, canUndo, canRedo) != 0;
 }
 @end
 static OxygenMenuTarget *menuTarget;
@@ -107,6 +96,7 @@ extern "C" void ed_native_menu(void *)
     item(windows, @"Inspector", 202);
     item(windows, @"Resources", 203);
     item(windows, @"Tiles", 204);
+    item(windows, @"Layers", 205);
     [windows addItem:NSMenuItem.separatorItem];
     item(windows, @"Reset Layout", 210);
     [NSApp setMainMenu:bar];

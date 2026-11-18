@@ -1,0 +1,473 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+struct SceneGizmo
+{
+    public float *Record;
+    public float[] Before;
+    public float[] Camera;
+    public Vector3[] Axes;
+    public int Mode;
+    public int Handle;
+    public Vector3 Pivot;
+    public Vector3 Direction;
+    public Vector3 Plane;
+    public Vector3 Start;
+    public ScreenPoint Mouse;
+    public float Radius;
+    public float Angle;
+    public bool ScreenRotation;
+
+    public SceneGizmo()
+    {
+        Before = new float[Stride];
+        Camera = new float[14];
+        Axes = new Vector3[3];
+    }
+
+    public ~SceneGizmo()
+    {
+        delete (Before);
+        delete (Camera);
+        delete (Axes);
+    }
+
+    public Vector3 Forward()
+    {
+        return Normalize(Vector3(Camera[3] - Camera[0], Camera[4] - Camera[1], Camera[5] - Camera[2]));
+    }
+
+    public Vector3 Center(float *record)
+    {
+        return Vector3(record[1], record[2] + record[6] * 0.5f, record[3]);
+    }
+
+    public Quaternion Orientation(float *record)
+    {
+        return RotationEuler(Scale(Vector3(record[12], record[4], record[13]), Pi / 180.0f));
+    }
+
+    public float HandleLength(Vector3 point)
+    {
+        float depth = Dot(Subtract(point, Vector3(Camera[0], Camera[1], Camera[2])), Forward());
+        return Clamp(depth * tanf(Camera[9] * Pi / 360.0f) * 184.0f / Max(1.0f, Camera[13]), 0.05f, 1000.0f);
+    }
+
+    public ScreenPoint Project(Vector3 point)
+    {
+        return ProjectGizmo(&Camera[0], point);
+    }
+
+    public void Ray(ScreenPoint point, float *output)
+    {
+        ed_screen_ray(&Camera[0], point.X - Camera[10], point.Y - Camera[11], cast<int>(Camera[12]),
+                      cast<int>(Camera[13]), output);
+    }
+
+    public int Hover(float *record, int mode, ScreenPoint mouse)
+    {
+        Vector3 pivot = Center(record);
+        if (Camera[12] <= 0.0f ||
+            Dot(Subtract(pivot, Vector3(Camera[0], Camera[1], Camera[2])), Forward()) <= 0.05f ||
+            mouse.X < Camera[10] || mouse.Y < Camera[11] || mouse.X > Camera[10] + Camera[12] ||
+            mouse.Y > Camera[11] + Camera[13])
+        {
+            return 0;
+        }
+        float radius = HandleLength(pivot);
+        if (mode != 2 && ScreenDistance(mouse, Project(pivot)) < 8.0f)
+        {
+            return 7;
+        }
+        int result = 0;
+        float best = 9.0f;
+        Vector3[] axes = Vector3[3];
+        for (int i = 0; i < 3; i++)
+        {
+            axes[i] = GizmoAxis(i);
+            if (mode == 3)
+            {
+                axes[i] = Rotate(Orientation(record), axes[i]);
+            }
+        }
+        if (mode == 2)
+        {
+            for (int axis = 0; axis < 3; axis++)
+            {
+                ScreenPoint previous = Project(GizmoRing(pivot, axis, 0.0f, radius));
+                for (int i = 1; i <= 96; i++)
+                {
+                    ScreenPoint next =
+                        Project(GizmoRing(pivot, axis, cast<float>(i) * 2.0f * Pi / 96.0f, radius));
+                    float distance = SegmentDistance(mouse, previous, next);
+                    if (distance < best)
+                    {
+                        best = distance;
+                        result = axis + 1;
+                    }
+                    previous = next;
+                }
+            }
+            return result;
+        }
+        for (int axis = 0; axis < 3; axis++)
+        {
+            ScreenPoint start = Project(Add(pivot, Scale(axes[axis], radius * 0.18f)));
+            ScreenPoint end = Project(Add(pivot, Scale(axes[axis], radius)));
+            if (ScreenDistance(start, end) < 16.0f)
+            {
+                continue;
+            }
+            float distance = SegmentDistance(mouse, start, end);
+            if (distance < best)
+            {
+                best = distance;
+                result = axis + 1;
+            }
+        }
+        if (result != 0 || mode != 1)
+        {
+            return result;
+        }
+        float[] ray = float[6];
+        Ray(mouse, &ray[0]);
+        for (int axis = 0; axis < 3; axis++)
+        {
+            int other = (axis + 1) % 3;
+            Vector3 hit = Vector3(0.0f, 0.0f, 0.0f);
+            if (!GizmoPlaneHit(&ray[0], pivot, Cross(axes[axis], axes[other]), &hit))
+            {
+                continue;
+            }
+            Vector3 local = Scale(Subtract(hit, pivot), 1.0f / radius);
+            float x = Dot(local, axes[axis]);
+            float y = Dot(local, axes[other]);
+            if (x >= 0.22f && x <= 0.43f && y >= 0.22f && y <= 0.43f)
+            {
+                return 4 + axis;
+            }
+        }
+        return 0;
+    }
+
+    public bool Begin(float *record, int mode, int handle, ScreenPoint mouse)
+    {
+        Record = record;
+        Mode = mode;
+        Handle = handle;
+        Angle = 0.0f;
+        ScreenRotation = false;
+        for (int i = 0; i < Stride; i++)
+        {
+            Before[i] = record[i];
+        }
+        Pivot = Center(record);
+        Radius = HandleLength(Pivot);
+        Mouse = mouse;
+        for (int i = 0; i < 3; i++)
+        {
+            Axes[i] = GizmoAxis(i);
+            if (mode == 3)
+            {
+                Axes[i] = Rotate(Orientation(record), Axes[i]);
+            }
+        }
+        if (handle <= 3)
+        {
+            Direction = Axes[handle - 1];
+            Plane = Direction;
+            if (mode != 2)
+            {
+                Plane = Subtract(Forward(), Scale(Direction, Dot(Forward(), Direction)));
+            }
+            if (Dot(Plane, Plane) < 0.0001f)
+            {
+                Record = null;
+                return false;
+            }
+            Plane = Normalize(Plane);
+        }
+        else if (handle < 7)
+        {
+            int axis = handle - 4;
+            Plane = Cross(Axes[axis], Axes[(axis + 1) % 3]);
+        }
+        else
+        {
+            Plane = Forward();
+        }
+        float[] ray = float[6];
+        Ray(mouse, &ray[0]);
+        ScreenRotation = mode == 2 && Abs(Dot(Plane, Vector3(ray[3], ray[4], ray[5]))) < 0.12f;
+        if (!ScreenRotation && !(mode == 3 && handle == 7) && !GizmoPlaneHit(&ray[0], Pivot, Plane, &Start))
+        {
+            Record = null;
+            return false;
+        }
+        return true;
+    }
+
+    public void Translate(Vector3 delta, bool snap)
+    {
+        Record[1] = Before[1] + GizmoSnap(delta.X, 0.25f, snap);
+        Record[2] = Before[2] + GizmoSnap(delta.Y, 0.25f, snap);
+        Record[3] = Before[3] + GizmoSnap(delta.Z, 0.25f, snap);
+    }
+
+    public void RotateBy(float angle, bool snap)
+    {
+        angle = GizmoSnap(angle, 15.0f * Pi / 180.0f, snap);
+        if (Abs(angle) < 0.0000001f)
+        {
+            Record[12] = Before[12];
+            Record[4] = Before[4];
+            Record[13] = Before[13];
+            return;
+        }
+        Vector3 v = Scale(Direction, Sin(angle * 0.5f));
+        Quaternion rotation =
+            CombineRotation(Quaternion(v.X, v.Y, v.Z, Cos(angle * 0.5f)), Orientation(&Before[0]));
+        float[] euler = float[3];
+        ed_euler(rotation.X, rotation.Y, rotation.Z, rotation.W, &euler[0]);
+        Record[12] = euler[0];
+        Record[4] = euler[1];
+        Record[13] = euler[2];
+    }
+
+    public void ScaleBy(float factor, bool snap)
+    {
+        factor = 1.0f + GizmoSnap(factor - 1.0f, 0.1f, snap);
+        bool[] affected = bool[3];
+        int kind = cast<int>(Before[0]);
+        if (Handle == 7 || kind >= 7)
+        {
+            affected[0] = true;
+            affected[1] = true;
+            affected[2] = true;
+        }
+        else
+        {
+            affected[Handle - 1] = true;
+            if (kind == 5 && Handle != 2)
+            {
+                affected[0] = true;
+                affected[2] = true;
+            }
+        }
+        float low = 0.0f;
+        float high = 100000000.0f;
+        for (int i = 0; i < 3; i++)
+        {
+            if (affected[i])
+            {
+                low = Max(low, 0.02f / Before[5 + i]);
+                high = Min(high, 1000.0f / Before[5 + i]);
+            }
+        }
+        factor = Clamp(factor, low, high);
+        for (int i = 0; i < 3; i++)
+        {
+            float scale = 1.0f;
+            if (affected[i])
+            {
+                scale = factor;
+            }
+            Record[5 + i] = Clamp(Before[5 + i] * scale, 0.02f, 1000.0f);
+        }
+        Record[2] = Before[2];
+        if (factor != 1.0f)
+        {
+            Record[2] = Pivot.Y - Record[6] * 0.5f;
+        }
+    }
+
+    public void Update(ScreenPoint mouse, bool snap)
+    {
+        float[] ray = float[6];
+        Ray(mouse, &ray[0]);
+        Vector3 hit = Vector3(0.0f, 0.0f, 0.0f);
+        if (Mode == 2)
+        {
+            if (ScreenRotation)
+            {
+                ScreenPoint center = Project(Pivot);
+                float length = ScreenDistance(Mouse, center);
+                float x = 0.0f;
+                float y = 0.0f;
+                if (length > 0.0f)
+                {
+                    x = (Mouse.X - center.X) / length;
+                    y = (Mouse.Y - center.Y) / length;
+                }
+                float sign = 1.0f;
+                if (Dot(Direction, Forward()) > 0.0f)
+                {
+                    sign = -1.0f;
+                }
+                Angle = sign * ((mouse.X - Mouse.X) * -y + (mouse.Y - Mouse.Y) * x) * 0.015f;
+            }
+            else if (GizmoPlaneHit(&ray[0], Pivot, Plane, &hit))
+            {
+                Vector3 a = Normalize(Subtract(Start, Pivot));
+                Vector3 b = Normalize(Subtract(hit, Pivot));
+                Angle += atan2f(Dot(Direction, Cross(a, b)), Dot(a, b));
+                Start = hit;
+            }
+            RotateBy(Angle, snap);
+            return;
+        }
+        if (Mode == 3 && Handle == 7)
+        {
+            ScaleBy(expf((mouse.X - Mouse.X - mouse.Y + Mouse.Y) * 0.008f), snap);
+            return;
+        }
+        if (!GizmoPlaneHit(&ray[0], Pivot, Plane, &hit))
+        {
+            return;
+        }
+        Vector3 delta = Subtract(hit, Start);
+        if (Mode == 3)
+        {
+            ScaleBy(1.0f + Dot(delta, Direction) / Radius, snap);
+        }
+        else
+        {
+            if (Handle <= 3)
+            {
+                delta = Scale(Direction, Dot(delta, Direction));
+            }
+            Translate(delta, snap);
+        }
+    }
+
+    public int Finish(bool cancel)
+    {
+        if (Record == null)
+        {
+            return 0;
+        }
+        bool changed = false;
+        for (int i = 0; i < Stride; i++)
+        {
+            if (Abs(Record[i] - Before[i]) > 0.00001f)
+            {
+                changed = true;
+            }
+            if (cancel)
+            {
+                Record[i] = Before[i];
+            }
+        }
+        Record = null;
+        if (cancel)
+        {
+            return 4;
+        }
+        if (changed)
+        {
+            return 2;
+        }
+        return 3;
+    }
+}
+
+static struct GizmoService
+{
+    public static SceneGizmo *Scene;
+}
+
+extern void ed_bind_scene_gizmo(function int(int, float *, float *, float *, float *) * callback);
+
+int UpdateSceneGizmoInput(SceneGizmo *gizmo, float *record, float *input)
+{
+    int mode = cast<int>(input[2]);
+    bool snap = input[4] != 0.0f;
+    bool cancel = input[5] != 0.0f;
+    ScreenPoint mouse = ScreenPoint(input[0], input[1]);
+    if (gizmo->Record != null)
+    {
+        if (cancel || input[6] != 0.0f || gizmo->Record != record || gizmo->Mode != mode || input[10] != 0.0f)
+        {
+            return gizmo->Finish(true);
+        }
+        gizmo->Update(mouse, snap);
+        if (input[11] == 0.0f)
+        {
+            return gizmo->Finish(false);
+        }
+        return 1;
+    }
+    if (cancel || record == null || mode < 1 || mode > 3 || input[7] == 0.0f)
+    {
+        return 0;
+    }
+    input[7] = 0.0f;
+    ScreenPoint press = ScreenPoint(input[8], input[9]);
+    int handle = gizmo->Hover(record, mode, press);
+    if (handle == 0 || !gizmo->Begin(record, mode, handle, press))
+    {
+        return 0;
+    }
+    gizmo->Update(mouse, snap);
+    if (input[11] != 0.0f)
+    {
+        return 1;
+    }
+    return gizmo->Finish(false);
+}
+
+int SceneGizmoDispatch(int operation, float *record, float *input, float *camera, float *state)
+{
+    SceneGizmo *gizmo = GizmoService.Scene;
+    for (int i = 0; i < 14; i++)
+    {
+        gizmo->Camera[i] = camera[i];
+    }
+    int result = 0;
+    bool snap = input[4] != 0.0f;
+    ScreenPoint mouse = ScreenPoint(input[0], input[1]);
+    if (operation == 0)
+    {
+        result = gizmo->Hover(record, cast<int>(input[2]), mouse);
+    }
+    if (operation == 1 && gizmo->Begin(record, cast<int>(input[2]), cast<int>(input[3]), mouse))
+    {
+        result = 1;
+    }
+    if (operation == 2)
+    {
+        result = gizmo->Finish(snap);
+    }
+    if (operation == 3)
+    {
+        gizmo->Update(mouse, snap);
+    }
+    if (operation == 4)
+    {
+        gizmo->Translate(Vector3(input[0], input[1], input[2]), snap);
+    }
+    if (operation == 5)
+    {
+        gizmo->RotateBy(input[0], snap);
+    }
+    if (operation == 6)
+    {
+        gizmo->ScaleBy(input[0], snap);
+    }
+    if (operation == 7)
+    {
+        result = UpdateSceneGizmoInput(gizmo, record, input);
+    }
+    state[0] = 0.0f;
+    if (gizmo->Record != null)
+    {
+        state[0] = 1.0f;
+    }
+    state[1] = cast<float>(gizmo->Mode);
+    state[2] = cast<float>(gizmo->Handle);
+    state[3] = gizmo->Start.X;
+    state[4] = gizmo->Start.Y;
+    state[5] = gizmo->Start.Z;
+    return result;
+}

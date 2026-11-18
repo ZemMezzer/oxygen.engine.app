@@ -1,24 +1,26 @@
 // Editor platform services. Scene commands, history, tile tools and play mode live in Xenon.
 #include <algorithm>
 #include <array>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_opengl3.h>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
+#include <imgui.h>
+#include <imgui_internal.h>
 #include <iomanip>
 #include <raylib.h>
 #include <raymath.h>
+#include <rlgl.h>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
-#include <functional>
-#include <deque>
-#include <imgui.h>
-#include <imgui_internal.h>
-#include <backends/imgui_impl_glfw.h>
-#include <backends/imgui_impl_opengl3.h>
-#include <rlgl.h>
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
 extern "C"
@@ -44,6 +46,16 @@ EDITOR_API void ed_workspace_close();
 EDITOR_API Vector2 ed_pointer();
 EDITOR_API int ed_input_blocked();
 EDITOR_API void ed_capture(int);
+EDITOR_API int ed_tile_guard();
+EDITOR_API void ed_tile_reset();
+EDITOR_API void ed_tile_close();
+int tileLoadModel(const std::filesystem::path &relative);
+namespace
+{
+void tilePalette(const float *state);
+extern bool tileFocused;
+extern bool tileCatalogDirty;
+} // namespace
 extern "C"
 {
     int ox_texture(const char *);
@@ -66,7 +78,52 @@ extern "C" void ed_gizmo_frame();
 namespace fs = std::filesystem;
 namespace
 {
-constexpr int stride = 15, capacity = 4096;
+constexpr int stride = 16, capacity = 4096;
+constexpr float sceneGridSpacing = 2.f;
+constexpr int maxWorldLayers = 4096;
+std::vector<std::string> worldLayers{"Layer 1"};
+// Editor-only flags: hidden = 1, locked = 2. Missing entries are visible and editable.
+std::unordered_map<std::string, int> layerFlags;
+int worldLayerFlags(int index)
+{
+    if (index < 0 || index >= (int)worldLayers.size())
+    {
+        return 3;
+    }
+    auto found = layerFlags.find(worldLayers[index]);
+    return found == layerFlags.end() ? 0 : found->second;
+}
+using TileCodecCallback = int (*)(int, const char *, float *, char *, char *);
+using TileMeshCallback = int (*)(float *, float *, unsigned short *, int *);
+TileCodecCallback tileCodecCallback = nullptr;
+TileMeshCallback tileMeshCallback = nullptr;
+using TileSelectionCallback = int (*)(int, float *, float *, float *, float *);
+TileSelectionCallback tileSelectionCallback = nullptr;
+using TileSetsCallback = int (*)(int, const char *, int, const char **, const char *, int);
+TileSetsCallback tileSetsCallback = nullptr;
+using ProjectCallback = int (*)(int, const char *, int);
+ProjectCallback projectCallback = nullptr;
+using WorkflowCallback = int (*)(int, const char *, float *, int);
+WorkflowCallback workflowCallback = nullptr;
+using LayersCallback = int (*)(int, int, int, const char *);
+LayersCallback layersCallback = nullptr;
+void replaceLayers(std::vector<std::string> names, std::unordered_map<std::string, int> flags = {})
+{
+    layersCallback(8, 0, 0, nullptr);
+    for (size_t i = 0; i < names.size(); i++)
+    {
+        layersCallback(1, 0, 0, names[i].c_str());
+        layersCallback(3, (int)i, flags[names[i]], nullptr);
+    }
+}
+int addWorldLayer(const std::string &input)
+{
+    return layersCallback(1, 0, 0, input.c_str());
+}
+const char *worldLayerName(int index)
+{
+    return index >= 0 && index < (int)worldLayers.size() ? worldLayers[index].c_str() : "Invalid layer";
+}
 struct Asset
 {
     int id, kind, handle = 0;
@@ -108,39 +165,9 @@ fs::path fromUtf8(const char *p)
 {
     return fs::u8path(p);
 }
-bool safeRelative(const fs::path &p)
-{
-    if (p.empty() || p.is_absolute() || p.has_root_name())
-    {
-        return false;
-    }
-    for (const auto &part : p)
-    {
-        if (part == "..")
-        {
-            return false;
-        }
-    }
-    return true;
-}
 int kind(const fs::path &p)
 {
-    std::string ext = p.extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".bmp" || ext == ".tga")
-    {
-        return 1;
-    }
-    if (ext == ".obj" || ext == ".gltf" || ext == ".glb" || ext == ".iqm")
-    {
-        return 2;
-    }
-    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
-    {
-        return 3;
-    }
-    return 4;
+    return tileCodecCallback(3, utf8(p).c_str(), nullptr, nullptr, nullptr);
 }
 Asset *asset(int id)
 {
@@ -155,45 +182,11 @@ Asset *asset(int id)
 }
 int registerAsset(const fs::path &relative)
 {
-    if (!safeRelative(relative) || assets.size() >= 512)
-    {
-        return 0;
-    }
-    for (auto &a : assets)
-    {
-        if (a.relative == relative)
-        {
-            return a.id;
-        }
-    }
-    // IDs are exactly representable in the Xenon float record. Files store paths, never IDs.
-    int id = (int)assets.size() + 1;
-    assets.push_back({id, kind(relative), 0, relative, false});
-    return id;
+    return projectCallback(1, utf8(relative).c_str(), 0);
 }
 void scan()
 {
-    try
-    {
-        std::vector<fs::path> found;
-        for (auto &entry :
-             fs::recursive_directory_iterator(root / "Assets", fs::directory_options::skip_permission_denied))
-        {
-            if (entry.is_regular_file() && !entry.is_symlink())
-            {
-                found.push_back(entry.path().lexically_relative(root / "Assets"));
-            }
-        }
-        std::sort(found.begin(), found.end());
-        for (auto &path : found)
-        {
-            registerAsset(path);
-        }
-    }
-    catch (const std::exception &e)
-    {
-        message(std::string("Asset scan failed: ") + e.what());
-    }
+    projectCallback(2, nullptr, 0);
 }
 void stopSound()
 {
@@ -213,7 +206,7 @@ void stopVoices()
     }
     voices.clear();
 }
-void clearAssets()
+void clearNativeAssetViews()
 {
     stopVoices();
     stopSound();
@@ -223,7 +216,7 @@ void clearAssets()
         {
             ox_release_texture(a.handle);
         }
-        if (a.kind == 2 && a.handle)
+        if ((a.kind == 2 || a.kind == 5) && a.handle)
         {
             ox_release_model(a.handle);
         }
@@ -233,13 +226,17 @@ void clearAssets()
     folder.clear();
     assetScroll = 0;
 }
+void clearAssets()
+{
+    projectCallback(4, nullptr, 0);
+}
 int handle(Asset *a)
 {
     if (!a || a->failed)
     {
         return 0;
     }
-    if (!a->handle && (a->kind == 1 || a->kind == 2))
+    if (!a->handle && (a->kind == 1 || a->kind == 2 || a->kind == 5))
     {
         std::string path = utf8(root / "Assets" / a->relative);
         if (!fs::exists(root / "Assets" / a->relative))
@@ -248,7 +245,9 @@ int handle(Asset *a)
             message("Missing asset: " + utf8(a->relative));
             return 0;
         }
-        a->handle = a->kind == 1 ? ox_texture(path.c_str()) : ox_model(path.c_str());
+        a->handle = a->kind == 1   ? ox_texture(path.c_str())
+                    : a->kind == 5 ? tileLoadModel(a->relative)
+                                   : ox_model(path.c_str());
         if (!a->handle)
         {
             a->failed = true;
@@ -257,335 +256,31 @@ int handle(Asset *a)
     }
     return a->handle;
 }
-fs::path chooseFolder(const char *title)
-{
-    char path[32768]{};
-    return ed_native_folder(title, path, sizeof(path)) ? fs::u8path(path) : fs::path();
-}
-fs::path chooseFile(bool save, bool scene)
-{
-    char path[32768]{};
-    std::string initial = utf8(root / (scene ? "Scenes" : "Assets"));
-    return ed_native_file(save, scene, initial.c_str(), path, sizeof(path)) ? fs::u8path(path) : fs::path();
-}
 bool openProject(const fs::path &path, bool create)
 {
-    if (path.empty())
-    {
-        return false;
-    }
-    try
-    {
-        if (!create && !fs::exists(path / "oxygen.project"))
-        {
-            message("Choose a folder containing oxygen.project.");
-            return false;
-        }
-        if (fs::exists(path / "oxygen.project"))
-        {
-            std::ifstream marker(path / "oxygen.project");
-            std::string magic;
-            int version = 0;
-            marker >> magic >> version;
-            if (!marker || magic != "OXYGEN_PROJECT" || version != 1)
-            {
-                message("Unsupported Oxygen project format.");
-                return false;
-            }
-        }
-        fs::create_directories(path / "Assets");
-        fs::create_directories(path / "Scenes");
-        if (!fs::exists(path / "oxygen.project"))
-        {
-            std::ofstream f(path / "oxygen.project");
-            f << "OXYGEN_PROJECT 1\n";
-            if (!f)
-            {
-                return false;
-            }
-        }
-        clearAssets();
-        root = fs::absolute(path).lexically_normal();
-        currentScene = root / "Scenes" / "Main.oxmap";
-        scan();
-        message("Project: " + utf8(root.filename()));
-        return true;
-    }
-    catch (const std::exception &e)
-    {
-        message(e.what());
-        return false;
-    }
-}
-void seedResources()
-{
-    // Original tiny fixtures, generated locally; no third-party asset downloads.
-    fs::path materials = root / "Assets" / "Materials", props = root / "Assets" / "Props",
-             sounds = root / "Assets" / "Sounds";
-    fs::create_directories(materials);
-    fs::create_directories(props);
-    fs::create_directories(sounds);
-    if (!fs::exists(materials / "Stone.png"))
-    {
-        Image image = GenImageChecked(128, 128, 16, 16, {154, 171, 184, 255}, {113, 132, 147, 255});
-        ExportImage(image, utf8(materials / "Stone.png").c_str());
-        UnloadImage(image);
-    }
-    if (!fs::exists(props / "Crate.obj"))
-    {
-        std::ofstream model(props / "Crate.obj");
-        model << "# Oxygen original sample prop\nmtllib Crate.mtl\no Crate\n"
-                 "v -0.5 0 -0.5\nv 0.5 0 -0.5\nv 0.5 1 -0.5\nv -0.5 1 -0.5\n"
-                 "v -0.5 0 0.5\nv 0.5 0 0.5\nv 0.5 1 0.5\nv -0.5 1 0.5\n"
-                 "vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n"
-                 "vn 0 0 -1\nvn 0 0 1\nvn -1 0 0\nvn 1 0 0\nvn 0 1 0\nvn 0 -1 0\n"
-                 "usemtl Wood\nf 4/4/1 3/3/1 2/2/1 1/1/1\nf 5/1/2 6/2/2 7/3/2 8/4/2\n"
-                 "f 1/1/3 5/2/3 8/3/3 4/4/3\nf 2/1/4 3/4/4 7/3/4 6/2/4\n"
-                 "f 4/1/5 8/2/5 7/3/5 3/4/5\nf 1/1/6 2/2/6 6/3/6 5/4/6\n";
-        std::ofstream material(props / "Crate.mtl");
-        material << "newmtl Wood\nKd 0.72 0.46 0.24\n";
-    }
-    if (!fs::exists(sounds / "Chime.wav"))
-    {
-        std::vector<short> samples(22050);
-        for (size_t i = 0; i < samples.size(); i++)
-        {
-            float t = (float)i / 22050.f;
-            samples[i] = (short)(std::sin(t * 440.f * 2 * PI) * std::exp(-t * 6) * 7000);
-        }
-        Wave wave{(unsigned)samples.size(), 22050, 16, 1, samples.data()};
-        ExportWave(wave, utf8(sounds / "Chime.wav").c_str());
-    }
-    scan();
-}
-bool copyResource(const fs::path &source, const fs::path &relative)
-{
-    if (!safeRelative(relative) || fs::is_symlink(source))
-    {
-        return false;
-    }
-    fs::path dest = root / "Assets" / relative;
-    if (fs::exists(dest))
-    {
-        return false; // Never overwrite an existing asset implicitly.
-    }
-    fs::create_directories(dest.parent_path());
-    return fs::copy_file(source, dest, fs::copy_options::none);
+    return projectCallback(0, utf8(path).c_str(), create ? 1 : 0) != 0;
 }
 void importPath(const fs::path &path)
 {
-    try
-    {
-        int copied = 0;
-        if (fs::is_directory(path))
-        {
-            // Do not recursively import a project into its own Assets folder.
-            auto rel = root.lexically_relative(fs::absolute(path));
-            if (!rel.empty() && *rel.begin() != "..")
-            {
-                message("Choose a resource folder outside this project.");
-                return;
-            }
-            for (auto &f :
-                 fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied))
-            {
-                if (f.is_regular_file() && !f.is_symlink())
-                {
-                    copied += copyResource(f.path(), path.filename() / f.path().lexically_relative(path));
-                }
-            }
-        }
-        else if (fs::is_regular_file(path))
-        {
-            copied += copyResource(path, path.filename());
-            // OBJ/glTF sidecars are preserved when importing their containing folder.
-        }
-        scan();
-        message("Imported " + std::to_string(copied) + " file(s). Existing files were kept.");
-    }
-    catch (const std::exception &e)
-    {
-        message(std::string("Import failed: ") + e.what());
-    }
+    projectCallback(3, utf8(path).c_str(), 0);
 }
+using SceneCallback = int (*)(int, const char *, float *, int);
+SceneCallback sceneCallback = nullptr;
 bool valid(const float *r)
 {
-    for (int j = 0; j < stride; j++)
-    {
-        if (!std::isfinite(r[j]))
-        {
-            return false;
-        }
-    }
-    int k = (int)r[0];
-    return r[0] == k && k >= 1 && k <= 9 && std::fabs(r[1]) <= 10000 && std::fabs(r[2]) <= 10000 &&
-           std::fabs(r[3]) <= 10000 && std::fabs(r[4]) <= 36000 && r[5] >= .02f && r[5] <= 1000 &&
-           r[6] >= .02f && r[6] <= 1000 && r[7] >= .02f && r[7] <= 1000 && r[8] >= 0 && r[8] <= 512 &&
-           r[8] == (int)r[8] && r[9] >= 0 && r[9] <= 5 && r[10] >= 0 && r[10] <= 2 && r[11] >= 0 &&
-           r[11] <= 32 && std::fabs(r[12]) <= 36000 && std::fabs(r[13]) <= 36000 && r[14] >= 0 &&
-           r[14] <= capacity && r[14] == (int)r[14];
+    return sceneCallback(2, nullptr, const_cast<float *>(r), stride) != 0;
 }
 bool validHierarchy(const float *data)
 {
-    for (int i = 0; i < capacity; i++)
-    {
-        if (!data[i * stride])
-        {
-            continue;
-        }
-        int current = i;
-        for (int depth = 0;; depth++)
-        {
-            if (depth >= 64)
-            {
-                return false;
-            }
-            current = (int)data[current * stride + 14] - 1;
-            if (current < 0)
-            {
-                break;
-            }
-            if (current >= capacity || current == i || !data[current * stride])
-            {
-                return false;
-            }
-        }
-    }
-    return true;
+    return sceneCallback(3, nullptr, const_cast<float *>(data), capacity) != 0;
 }
 bool saveRecords(const fs::path &path, const float *data, int count)
 {
-    try
-    {
-        if (count != capacity)
-        {
-            return false;
-        }
-        int used = 0;
-        for (int i = 0; i < count; i++)
-        {
-            if (data[i * stride])
-            {
-                if (!valid(data + i * stride))
-                {
-                    message("Invalid scene data; save cancelled.");
-                    return false;
-                }
-                used++;
-            }
-        }
-        if (!validHierarchy(data))
-        {
-            message("Invalid hierarchy; save cancelled.");
-            return false;
-        }
-        fs::create_directories(path.parent_path());
-        fs::path temp = path;
-        temp += ".tmp";
-        std::ofstream f(temp, std::ios::trunc);
-        f << "OXYGEN_TILE_SCENE 3\n" << used << "\n" << std::setprecision(9);
-        for (int i = 0; i < count; i++)
-        {
-            const float *r = data + i * stride;
-            if (!r[0])
-            {
-                continue;
-            }
-            f << i << ' ';
-            for (int j = 0; j < stride; j++)
-            {
-                f << (j == 8 ? 0 : r[j]) << ' ';
-            }
-            Asset *a = asset((int)r[8]);
-            f << std::quoted(a ? utf8(a->relative) : std::string()) << '\n';
-        }
-        f.flush();
-        bool ok = (bool)f;
-        f.close();
-        if (!ok || !ed_native_replace(utf8(temp).c_str(), utf8(path).c_str()))
-        {
-            message("Save failed; previous scene retained.");
-            return false;
-        }
-        currentScene = path;
-        message("Saved " + utf8(path.filename()));
-        return true;
-    }
-    catch (const std::exception &e)
-    {
-        message(e.what());
-        return false;
-    }
+    return workflowCallback(8, utf8(path).c_str(), const_cast<float *>(data), count) != 0;
 }
 bool loadRecords(const fs::path &path, float *data, int count)
 {
-    try
-    {
-        std::ifstream f(path);
-        std::string magic;
-        int version = 0, n = 0;
-        f >> magic >> version >> n;
-        if (!f || magic != "OXYGEN_TILE_SCENE" || (version < 1 || version > 3) || n < 0 || n > count ||
-            count != capacity)
-        {
-            return false;
-        }
-        std::vector<float> records(count * stride, 0);
-        std::vector<fs::path> refs(count);
-        for (int i = 0; i < n; i++)
-        {
-            int slot = i;
-            if (version == 3)
-            {
-                f >> slot;
-            }
-            if (!f || slot < 0 || slot >= count || records[slot * stride] != 0)
-            {
-                return false;
-            }
-            float *r = records.data() + slot * stride;
-            for (int j = 0; j < (version == 1 ? 12 : version == 2 ? 14 : stride); j++)
-            {
-                f >> r[j];
-            }
-            std::string reference;
-            f >> std::quoted(reference);
-            refs[slot] = fs::u8path(reference);
-            if (!f || !valid(r) || (!reference.empty() && !safeRelative(refs[slot])))
-            {
-                return false;
-            }
-        }
-        f >> std::ws;
-        if (!f.eof())
-        {
-            return false;
-        }
-        if (!validHierarchy(records.data()))
-        {
-            return false;
-        }
-        for (int i = 0; i < count; i++)
-        {
-            if (!refs[i].empty())
-            {
-                int id = registerAsset(refs[i]);
-                if (!id)
-                {
-                    return false;
-                }
-                records[i * stride + 8] = (float)id;
-            }
-        }
-        std::copy(records.begin(), records.end(), data);
-        currentScene = path;
-        message("Loaded " + utf8(path.filename()));
-        return true;
-    }
-    catch (...)
-    {
-        return false;
-    }
+    return workflowCallback(9, utf8(path).c_str(), data, count) != 0;
 }
 void renderModelPreview(int id)
 {
@@ -632,29 +327,11 @@ EDITOR_API int ed_init()
     ed_workspace_init();
     ed_gizmo_init();
     SetWindowMinSize(1100, 850);
-    const char *project = std::getenv("OXYGEN_EDITOR_PROJECT");
-    fs::path initial =
-        project ? fromUtf8(project) : fs::path(GetApplicationDirectory()) / "../../../Projects/Starter";
-    bool fresh = !fs::exists(initial / "oxygen.project");
-    if (!openProject(initial, true))
-    {
-        return 0;
-    }
-    if (fresh)
-    {
-        try
-        {
-            seedResources();
-        }
-        catch (...)
-        {
-            message("Sample resources could not be generated.");
-        }
-    }
-    return 1;
+    return workflowCallback(0, nullptr, nullptr, 0);
 }
 EDITOR_API void ed_close()
 {
+    ed_tile_close();
     ed_gizmo_close();
     ed_capture(0);
     ed_workspace_close();
@@ -675,51 +352,161 @@ EDITOR_API void ed_close()
 }
 EDITOR_API int ed_guard(int dirty)
 {
-    if (!dirty || smoke())
-    {
-        return 1;
-    }
-    return ed_native_guard();
+    return workflowCallback(10, nullptr, nullptr, dirty);
 }
 EDITOR_API int ed_project(int create)
 {
-    return openProject(chooseFolder(create ? "New Oxygen project folder" : "Open Oxygen project"),
-                       create != 0);
+    return workflowCallback(6, nullptr, nullptr, create);
 }
 EDITOR_API int ed_save(const float *data, int count)
 {
-    fs::path path = currentScene;
-    if (path.empty())
-    {
-        path = smoke() ? root / "Scenes" / "Main.oxmap" : chooseFile(true, true);
-    }
-    return !path.empty() && saveRecords(path, data, count);
+    return workflowCallback(2, nullptr, const_cast<float *>(data), count);
 }
 EDITOR_API int ed_save_as(const float *data, int count)
 {
-    fs::path p = chooseFile(true, true);
-    return !p.empty() && saveRecords(p, data, count);
+    return workflowCallback(3, nullptr, const_cast<float *>(data), count);
 }
 EDITOR_API int ed_load(float *data, int count, int automatic)
 {
-    fs::path p = automatic ? currentScene : chooseFile(false, true);
-    if (p.empty())
-    {
-        return 0;
-    }
-    if (loadRecords(p, data, count))
-    {
-        return 1;
-    }
-    if (fs::exists(p))
-    {
-        message("Scene rejected: invalid or unsupported data. Current scene kept.");
-    }
-    return 0;
+    return workflowCallback(4, automatic ? "" : nullptr, data, count);
+}
+EDITOR_API void ed_bind_tile_codec(TileCodecCallback callback)
+{
+    tileCodecCallback = callback;
+}
+EDITOR_API void ed_bind_tile_mesh(TileMeshCallback callback)
+{
+    tileMeshCallback = callback;
+}
+EDITOR_API void ed_bind_tile_selection(TileSelectionCallback callback)
+{
+    tileSelectionCallback = callback;
+}
+EDITOR_API void ed_project_point(float *values, float x, float y, float z, int width, int height,
+                                 float *screen)
+{
+    Camera3D camera{{values[0], values[1], values[2]},
+                    {values[3], values[4], values[5]},
+                    {values[6], values[7], values[8]},
+                    values[9],
+                    CAMERA_PERSPECTIVE};
+    Vector2 projected = GetWorldToScreenEx({x, y, z}, camera, width, height);
+    screen[0] = projected.x;
+    screen[1] = projected.y;
+}
+EDITOR_API void ed_bind_tilesets(TileSetsCallback callback)
+{
+    tileSetsCallback = callback;
+}
+#include "editor_files.inl"
+EDITOR_API void ed_bind_project(ProjectCallback callback)
+{
+    projectCallback = callback;
+}
+EDITOR_API void ed_assets_view_clear()
+{
+    clearNativeAssetViews();
+}
+EDITOR_API void ed_assets_view_item(int id, int kind, const char *relative)
+{
+    assets.push_back({id, kind, 0, fromUtf8(relative), false});
+}
+EDITOR_API void ed_project_view_root(const char *path)
+{
+    root = fromUtf8(path);
+    currentScene = root / "Scenes" / "Main.oxmap";
+}
+EDITOR_API void ed_screen_ray(float *values, float x, float y, int width, int height, float *result)
+{
+    Camera3D camera{{values[0], values[1], values[2]},
+                    {values[3], values[4], values[5]},
+                    {values[6], values[7], values[8]},
+                    values[9],
+                    CAMERA_PERSPECTIVE};
+    Ray ray = GetScreenToWorldRayEx({x, y}, camera, width, height);
+    result[0] = ray.position.x;
+    result[1] = ray.position.y;
+    result[2] = ray.position.z;
+    result[3] = ray.direction.x;
+    result[4] = ray.direction.y;
+    result[5] = ray.direction.z;
+}
+EDITOR_API void ed_bind_scene(SceneCallback callback)
+{
+    sceneCallback = callback;
+}
+EDITOR_API int ed_atomic_replace(const char *from, const char *to)
+{
+    return ed_native_replace(from, to);
+}
+EDITOR_API const char *ed_asset_path(int id)
+{
+    static std::string result;
+    auto *item = asset(id);
+    result = item ? utf8(item->relative) : std::string();
+    return result.c_str();
+}
+EDITOR_API int ed_register_asset(const char *relative)
+{
+    return registerAsset(fromUtf8(relative));
+}
+EDITOR_API void ed_bind_layers(LayersCallback callback)
+{
+    layersCallback = callback;
+}
+EDITOR_API void ed_layers_view_begin()
+{
+    worldLayers.clear();
+    layerFlags.clear();
+}
+EDITOR_API void ed_layers_view_item(const char *name, int flags)
+{
+    worldLayers.emplace_back(name);
+    layerFlags[name] = flags;
 }
 EDITOR_API void ed_new_scene()
 {
-    currentScene.clear();
+    workflowCallback(5, nullptr, nullptr, 0);
+}
+EDITOR_API int ed_layer_count()
+{
+    return (int)worldLayers.size();
+}
+EDITOR_API int ed_layer_add(const char *name)
+{
+    return layersCallback(1, 0, 0, name);
+}
+EDITOR_API int ed_layer_visible(int index)
+{
+    return (worldLayerFlags(index) & 1) == 0;
+}
+EDITOR_API int ed_layer_editable(int index)
+{
+    return worldLayerFlags(index) == 0;
+}
+EDITOR_API int ed_layer_set_flags(int index, int flags)
+{
+    return layersCallback(3, index, flags, nullptr);
+}
+EDITOR_API int ed_layer_rename(int index, const char *input)
+{
+    return layersCallback(2, index, 0, input);
+}
+EDITOR_API int ed_layer_remove(int index)
+{
+    return layersCallback(4, index, 0, nullptr);
+}
+EDITOR_API int ed_layers_snapshot(int active)
+{
+    return layersCallback(5, active, 0, nullptr);
+}
+EDITOR_API int ed_layers_restore(int id)
+{
+    return layersCallback(6, id, 0, nullptr);
+}
+EDITOR_API void ed_layers_release(int id)
+{
+    layersCallback(7, id, 0, nullptr);
 }
 EDITOR_API int ed_asset_id()
 {
@@ -755,12 +542,7 @@ EDITOR_API int ed_hierarchy_selection()
 }
 EDITOR_API void ed_import(int directory)
 {
-    auto p = directory ? chooseFolder("Import resource folder (keeps OBJ / glTF dependencies)")
-                       : chooseFile(false, false);
-    if (!p.empty())
-    {
-        importPath(p);
-    }
+    workflowCallback(7, nullptr, nullptr, directory);
 }
 EDITOR_API void ed_sound(int id, float volume)
 {
@@ -842,6 +624,172 @@ EDITOR_API void ed_voice(int slot, int id, float volume)
         PlaySound(found->sound);
     }
 }
+EDITOR_API int ed_layer_tests()
+{
+    if (!smoke())
+    {
+        return 0;
+    }
+    auto previousLayers = worldLayers;
+    auto previousFlags = layerFlags;
+    auto previousScene = currentScene;
+    ed_new_scene();
+    int failures = worldLayers != std::vector<std::string>{"Layer 1"};
+    if (addWorldLayer("  Decorations  ") != 1 || worldLayers.back() != "Decorations" ||
+        addWorldLayer("Decorations") != -1 || addWorldLayer("   ") != -1)
+    {
+        failures++;
+    }
+    for (int i = 2; i < 12; i++)
+    {
+        if (addWorldLayer("Custom " + std::to_string(i)) != i)
+        {
+            failures++;
+        }
+    }
+    if (addWorldLayer("Декорации \"верх\"") != 12)
+    {
+        failures++;
+    }
+    auto expectedLayers = worldLayers;
+    std::vector<float> records(capacity * stride, 0), restored(records);
+    records[0] = 2;
+    records[1] = records[3] = 1;
+    records[5] = records[6] = records[7] = 2;
+    records[11] = 2;
+    records[15] = 12;
+    auto path = root / "Scenes" / "custom-layers-regression.oxmap";
+    if (!saveRecords(path, records.data(), capacity))
+    {
+        failures++;
+    }
+    ed_new_scene();
+    if (!loadRecords(path, restored.data(), capacity) || restored != records || worldLayers != expectedLayers)
+    {
+        failures++;
+    }
+    auto retained = restored;
+    {
+        std::ofstream f(path);
+        f << "OXYGEN_TILE_SCENE 5\n0\n2\n\"Same\"\n\"Same\"\n";
+    }
+    if (loadRecords(path, restored.data(), capacity) || restored != retained || worldLayers != expectedLayers)
+    {
+        failures++;
+    }
+    {
+        std::ofstream f(path);
+        f << "OXYGEN_TILE_SCENE 5\n1\n1\n\"Layer 1\"\n0 2 1 0 1 0 2 2 2 0 0 0 2 0 0 0 7 \"\"\n";
+    }
+    if (loadRecords(path, restored.data(), capacity) || restored != retained || worldLayers != expectedLayers)
+    {
+        failures++;
+    }
+    {
+        std::ofstream f(path);
+        f << "OXYGEN_TILE_SCENE 4\n1\n0 2 1 0 1 0 2 2 2 0 0 0 2 0 0 0 7 \"\"\n";
+    }
+    if (!loadRecords(path, restored.data(), capacity) || worldLayers.size() != 8 ||
+        worldLayers[0] != "World" || worldLayers[7] != "Layer 8" || restored[15] != 7)
+    {
+        failures++;
+    }
+    replaceLayers(previousLayers, previousFlags);
+    currentScene = previousScene;
+    puts(
+        failures
+            ? "FAIL: custom scene layers."
+            : "PASS: Layer 1 default, custom names and >8 layers, v5 persistence, invalid data isolation and v4 migration.");
+    return failures;
+}
+
+EDITOR_API int ed_layer_properties_tests()
+{
+    if (!smoke())
+    {
+        return 0;
+    }
+    int failures = 0;
+    int initial = ed_layers_snapshot(0);
+    auto previousScene = currentScene;
+    ed_new_scene();
+    int second = ed_layer_add("Props");
+    ed_layer_set_flags(second, 3);
+    int before = ed_layers_snapshot(second);
+    if (!ed_layer_rename(second, "  Set dressing  ") || worldLayers[second] != "Set dressing" ||
+        ed_layer_visible(second) || ed_layer_editable(second) || ed_layer_rename(second, "Layer 1") ||
+        ed_layer_rename(second, "  ") || ed_layer_rename(-1, "Invalid") || ed_layer_set_flags(second, 4))
+    {
+        failures++;
+    }
+    int after = ed_layers_snapshot(second);
+    ed_layers_restore(before);
+    if (worldLayers[second] != "Props" || worldLayerFlags(second) != 3)
+    {
+        failures++;
+    }
+    ed_layers_restore(after);
+    std::vector<float> records(capacity * stride, 0), restored(records);
+    records[0] = 2;
+    records[5] = records[6] = records[7] = 2;
+    records[11] = 1;
+    records[15] = (float)second;
+    auto path = root / "Scenes" / "layer-properties-regression.oxmap";
+    if (!saveRecords(path, records.data(), capacity))
+    {
+        failures++;
+    }
+    ed_new_scene();
+    if (!loadRecords(path, restored.data(), capacity) || restored != records || worldLayers.size() != 2 ||
+        worldLayers[1] != "Set dressing" || worldLayerFlags(0) != 0 || worldLayerFlags(1) != 3)
+    {
+        failures++;
+    }
+    {
+        std::ofstream f(path);
+        f << "OXYGEN_TILE_SCENE 6\n0\n1\n\"Bad flags\" 9\n";
+    }
+    if (loadRecords(path, restored.data(), capacity) || restored != records || worldLayers.size() != 2 ||
+        worldLayerFlags(1) != 3)
+    {
+        failures++;
+    }
+    {
+        std::ofstream f(path);
+        f << "OXYGEN_TILE_SCENE 5\n0\n2\n\"Layer 1\"\n\"Legacy\"\n";
+    }
+    if (!loadRecords(path, restored.data(), capacity) || worldLayers.size() != 2 || !ed_layer_visible(1) ||
+        !ed_layer_editable(1))
+    {
+        failures++;
+    }
+    ed_layer_set_flags(1, 2);
+    if (!ed_layer_visible(1) || ed_layer_editable(1))
+    {
+        failures++;
+    }
+    ed_layer_set_flags(1, 1);
+    if (ed_layer_visible(1) || ed_layer_editable(1))
+    {
+        failures++;
+    }
+    ed_layer_remove(0);
+    if (worldLayers[0] != "Legacy" || worldLayerFlags(0) != 1)
+    {
+        failures++;
+    }
+    ed_layers_restore(initial);
+    ed_layers_release(initial);
+    ed_layers_release(before);
+    ed_layers_release(after);
+    currentScene = previousScene;
+    puts(
+        failures
+            ? "FAIL: layer properties."
+            : "PASS: layer rename validation, visibility/lock, history, v6 persistence, atomic flag validation and v5 migration.");
+    return failures;
+}
+
 EDITOR_API int ed_storage_test(const float *data)
 {
     if (!smoke())
@@ -859,6 +807,8 @@ EDITOR_API int ed_storage_test(const float *data)
         return 1;
     }
     fs::path previousScene = currentScene;
+    auto previousLayers = worldLayers;
+    auto previousFlags = layerFlags;
     fs::path legacy = root / "Scenes" / "legacy-gizmo-test.oxmap";
     {
         std::ofstream f(legacy);
@@ -866,13 +816,19 @@ EDITOR_API int ed_storage_test(const float *data)
     }
     bool compatible =
         loadRecords(legacy, copy.data(), capacity) && copy[4] == 45 && copy[12] == 0 && copy[13] == 0;
+    copy[1] = 20001;
+    copy[2] = -20002;
+    copy[3] = -20003;
+    addWorldLayer("Decorations test");
+    copy[15] = 1;
     copy[12] = 30;
     copy[13] = -25;
     fs::path rotated = root / "Scenes" / "rotation-gizmo-test.oxmap";
     bool saved = saveRecords(rotated, copy.data(), capacity);
     copy.assign(copy.size(), 0);
     bool restored = saved && loadRecords(rotated, copy.data(), capacity) && copy[4] == 45 && copy[12] == 30 &&
-                    copy[13] == -25;
+                    copy[13] == -25 && copy[15] == 1 && copy[1] == 20001 && copy[2] == -20002 &&
+                    copy[3] == -20003;
     // Sparse IDs survive saves so parent references cannot silently target another object.
     std::copy(copy.begin(), copy.begin() + stride, copy.begin() + 48 * stride);
     copy[48 * stride + 14] = 1;
@@ -889,6 +845,7 @@ EDITOR_API int ed_storage_test(const float *data)
     auto retained = copy;
     bool cycleRejected = !loadRecords(test, copy.data(), capacity) && copy == retained;
     currentScene = previousScene;
+    replaceLayers(previousLayers, previousFlags);
     if (!compatible || !restored || !hierarchyLoaded || !cycleRejected)
     {
         return 1;
@@ -919,6 +876,7 @@ EDITOR_API void ed_ray(float *out, float x, float y, float z, float fx, float fy
 {
     ed_gizmo_context(x, y, z, fx, fy, fz, fov, view.x, view.y, view.width, view.height);
     Camera3D c{{x, y, z}, {x + fx, y + fy, z + fz}, {0, 1, 0}, fov, CAMERA_PERSPECTIVE};
+    viewCamera = c;
     Vector2 mouse = ed_pointer();
     mouse.x -= view.x;
     mouse.y -= view.y;
@@ -930,6 +888,25 @@ EDITOR_API void ed_ray(float *out, float x, float y, float z, float fx, float fy
     out[4] = ray.direction.y;
     out[5] = ray.direction.z;
 }
+EDITOR_API int ed_grid_ray(const float *ray, const float *bounds, float *out)
+{
+    RayCollision hit =
+        GetRayCollisionBox({{ray[0], ray[1], ray[2]}, {ray[3], ray[4], ray[5]}},
+                           {{bounds[0], bounds[1], bounds[2]}, {bounds[3], bounds[4], bounds[5]}});
+    if (!hit.hit || hit.distance < 0)
+    {
+        return 0;
+    }
+    out[0] = hit.point.x;
+    out[1] = hit.point.y;
+    out[2] = hit.point.z;
+    out[3] = hit.normal.x;
+    out[4] = hit.normal.y;
+    out[5] = hit.normal.z;
+    out[6] = hit.distance;
+    return 1;
+}
+
 EDITOR_API int ed_pick(const float *ray, float x, float y, float z, float sx, float sy, float sz, float yaw,
                        float pitch, float roll, float *distance)
 {
@@ -965,15 +942,26 @@ EDITOR_API void ed_view_end(int playing)
 {
     EndTextureMode();
 }
-EDITOR_API void ed_grid(float height)
+EDITOR_API void ed_grid(float height, float centerX, float centerZ)
 {
-    for (int i = -16; i <= 16; i++)
+    constexpr int radius = 32;
+    constexpr float extent = radius * sceneGridSpacing;
+    float cx = std::floor(centerX / sceneGridSpacing) * sceneGridSpacing;
+    float cz = std::floor(centerZ / sceneGridSpacing) * sceneGridSpacing;
+    for (int i = -radius; i <= radius; i++)
     {
-        Color c = i == 0 ? Color{85, 130, 136, 255} : Color{65, 78, 92, 255};
-        DrawLine3D({(float)i * 2, height, -32}, {(float)i * 2, height, 32}, c);
-        DrawLine3D({-32, height, (float)i * 2}, {32, height, (float)i * 2}, c);
+        float x = cx + i * sceneGridSpacing;
+        float z = cz + i * sceneGridSpacing;
+        Color minor{65, 78, 92, 255}, axis{85, 130, 136, 255};
+        DrawLine3D({x, height, cz - extent}, {x, height, cz + extent}, x == 0 ? axis : minor);
+        DrawLine3D({cx - extent, height, z}, {cx + extent, height, z}, z == 0 ? axis : minor);
     }
 }
+EDITOR_API float ed_grid_floor(float value)
+{
+    return std::floor(value);
+}
+
 EDITOR_API void ed_outline(float x, float y, float z, float sx, float sy, float sz, unsigned color)
 {
     DrawCubeWires({x, y + sy * .5f, z}, sx + .02f, sy + .02f, sz + .02f, GetColor(color));
@@ -982,12 +970,49 @@ EDITOR_API void ed_outline(float x, float y, float z, float sx, float sy, float 
 
 EDITOR_API int ed_validate_scene(const float *records)
 {
-    for (int i = 0; i < capacity; i++)
+    return sceneCallback(4, nullptr, const_cast<float *>(records), capacity);
+}
+
+#include "editor_tiles.inl"
+
+EDITOR_API void ed_bind_workflow(WorkflowCallback callback)
+{
+    workflowCallback = callback;
+}
+EDITOR_API const char *ed_application_directory()
+{
+    return GetApplicationDirectory();
+}
+EDITOR_API const char *ed_choose_dialog(int kind, const char *title, const char *initial)
+{
+    static char buffer[32768];
+    buffer[0] = 0;
+    if (kind == 0)
     {
-        if (records[i * stride] != 0 && !valid(records + i * stride))
-        {
-            return 0;
-        }
+        ed_native_folder(title, buffer, sizeof(buffer));
     }
-    return validHierarchy(records);
+    else
+    {
+        ed_native_file(kind == 2 || kind == 4, kind >= 3, initial, buffer, sizeof(buffer));
+    }
+    return buffer;
+}
+EDITOR_API int ed_dialog_guard()
+{
+    return ed_native_guard();
+}
+EDITOR_API void ed_scene_view(const char *path)
+{
+    currentScene = fromUtf8(path);
+}
+EDITOR_API void ed_checker_image(const char *path)
+{
+    Image image = GenImageChecked(128, 128, 16, 16, {154, 171, 184, 255}, {113, 132, 147, 255});
+    ExportImage(image, path);
+    UnloadImage(image);
+}
+EDITOR_API void ed_export_wave(short *samples, int count, int rate, const char *path)
+{
+    Wave wave{(unsigned)count, (unsigned)rate, 16, 1, samples};
+    ExportWave(wave, path);
 }

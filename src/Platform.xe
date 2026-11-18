@@ -8,6 +8,9 @@ extern int ed_save(float *data, int count);
 extern int ed_save_as(float *data, int count);
 extern int ed_load(float *data, int count, int automatic);
 extern void ed_new_scene();
+extern int ed_layer_delete_source();
+extern int ed_layer_delete_target();
+extern int ed_layer_tests();
 extern int ed_asset_id();
 extern int ed_asset_find(readonly byte *path);
 extern int ed_storage_test(float *data);
@@ -33,7 +36,8 @@ extern int ed_pick(float *ray, float x, float y, float z, float sx, float sy, fl
                    float pitch, float roll, float *distance);
 extern void ed_view_begin();
 extern void ed_view_end(int playing);
-extern void ed_grid(float height);
+extern void ed_grid(float height, float centerX, float centerZ);
+extern float ed_grid_floor(float value);
 extern void ed_outline(float x, float y, float z, float sx, float sy, float sz, uint color);
 extern int ed_ui(float *state, float *records);
 
@@ -61,4 +65,12 @@ bool EditorKeyDown(int key)
 
 extern int ed_workspace_tests();
 
-extern int ed_validate_scene(float *records);
+extern int ed_tile_ui(float *data, float *selection, int cursor, int count);
+extern void ed_tile_values(float *values);
+extern int ed_tile_tests();
+
+extern int ed_tile_suspend();
+
+extern int ed_grid_ray(float *ray, float *bounds, float *hit);
+
+extern int ed_layer_properties_tests();

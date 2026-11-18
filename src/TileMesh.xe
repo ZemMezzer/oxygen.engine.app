@@ -1,0 +1,149 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+// A single indexed mesh. UV/normal seams remain separate; identical triangles are discarded.
+// Fixed hash tables are sized from the editor's face limit, with a load factor below 0.5.
+int CompileTileMesh(float *data, float *vertices, ushort *indices, int *counts)
+{
+    unique<int[]> vertexBins = new int[8192];
+    unique<long[]> vertexKeys = new long[TileFaces * 6 * 8];
+    unique<ulong[]> triangleBins = new ulong[2048];
+    int vertexCount = 0;
+    int indexCount = 0;
+    int removed = 0;
+    int[] corner = int[6];
+    corner[0] = 0;
+    corner[1] = 1;
+    corner[2] = 2;
+    corner[3] = 0;
+    corner[4] = 2;
+    corner[5] = 3;
+    Vector3[] points = Vector3[4];
+    float[] vertex = float[8];
+    long[] key = long[8];
+    int[] ids = int[3];
+    for (int face = 0; face < TileFaces; face++)
+    {
+        float *f = data + TileFaceStart + face * TileFaceStride;
+        if (f[0] == 0.0f)
+        {
+            continue;
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            int at = cast<int>(f[1 + i]) * 4;
+            points[i] = Vector3(data[at + 1], data[at + 2], data[at + 3]);
+        }
+        for (int triangle = 0; triangle < 6; triangle += 3)
+        {
+            Vector3 n = Cross(Subtract(points[corner[triangle + 1]], points[corner[triangle]]),
+                              Subtract(points[corner[triangle + 2]], points[corner[triangle]]));
+            float length = Length(n);
+            if (length < 0.000001f)
+            {
+                removed++;
+                continue;
+            }
+            n = Scale(n, 1.0f / length);
+            for (int j = 0; j < 3; j++)
+            {
+                int c = corner[triangle + j];
+                vertex[0] = points[c].X;
+                vertex[1] = points[c].Y;
+                vertex[2] = points[c].Z;
+                vertex[3] = n.X;
+                vertex[4] = n.Y;
+                vertex[5] = n.Z;
+                vertex[6] = f[5 + c * 2];
+                vertex[7] = f[6 + c * 2];
+                ulong hash = cast<ulong>(2166136261u);
+                for (int k = 0; k < 8; k++)
+                {
+                    double value = cast<double>(vertex[k]) * 1000000.0;
+                    if (value < 0.0)
+                    {
+                        value -= 0.5;
+                    }
+                    else
+                    {
+                        value += 0.5;
+                    }
+                    key[k] = cast<long>(value);
+                    hash = (hash ^ cast<ulong>(key[k])) * cast<ulong>(16777619);
+                }
+                int bucket = cast<int>(hash & cast<ulong>(8191));
+                while (vertexBins[bucket] != 0)
+                {
+                    int found = vertexBins[bucket] - 1;
+                    bool same = true;
+                    for (int k = 0; k < 8; k++)
+                    {
+                        if (vertexKeys[found * 8 + k] != key[k])
+                        {
+                            same = false;
+                        }
+                    }
+                    if (same)
+                    {
+                        break;
+                    }
+                    bucket = (bucket + 1) & 8191;
+                }
+                if (vertexBins[bucket] == 0)
+                {
+                    vertexBins[bucket] = vertexCount + 1;
+                    for (int k = 0; k < 8; k++)
+                    {
+                        vertices[vertexCount * 8 + k] = vertex[k];
+                        vertexKeys[vertexCount * 8 + k] = key[k];
+                    }
+                    vertexCount++;
+                }
+                ids[j] = vertexBins[bucket] - 1;
+            }
+            int a = ids[0];
+            int b = ids[1];
+            int c = ids[2];
+            if (a > b)
+            {
+                int swap = a;
+                a = b;
+                b = swap;
+            }
+            if (b > c)
+            {
+                int swap = b;
+                b = c;
+                c = swap;
+            }
+            if (a > b)
+            {
+                int swap = a;
+                a = b;
+                b = swap;
+            }
+            ulong triangleKey =
+                (cast<ulong>(a) | (cast<ulong>(b) << 12) | (cast<ulong>(c) << 24)) + cast<ulong>(1);
+            int bucket = cast<int>((triangleKey ^ (triangleKey >> 17)) & cast<ulong>(2047));
+            while (triangleBins[bucket] != cast<ulong>(0) && triangleBins[bucket] != triangleKey)
+            {
+                bucket = (bucket + 1) & 2047;
+            }
+            if (triangleBins[bucket] == triangleKey)
+            {
+                removed++;
+                continue;
+            }
+            triangleBins[bucket] = triangleKey;
+            for (int j = 0; j < 3; j++)
+            {
+                indices[indexCount++] = cast<ushort>(ids[j]);
+            }
+        }
+    }
+    counts[0] = vertexCount;
+    counts[1] = indexCount;
+    counts[2] = removed;
+    return 1;
+}

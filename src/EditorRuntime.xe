@@ -1,0 +1,144 @@
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+void InitializeEditorLogic()
+{
+    LayerService.Layers = new Vector<WorldLayer>();
+    LayerService.History = new Vector<LayerHistory *>();
+    ed_bind_layers(function int(int op, int index, int value, readonly byte *text) {
+        return LayersDispatch(op, index, value, text);
+    });
+    ed_bind_scene(function int(int op, readonly byte *path, float *records, int count) {
+        return SceneDispatch(op, path, records, count);
+    });
+    ed_bind_tile_codec(function int(int op, readonly byte *path, float *data, byte *name, byte *texture) {
+        return TileCodecDispatch(op, path, data, name, texture);
+    });
+    ed_bind_tile_mesh(function int(float *data, float *vertices, ushort *indices, int *counts) {
+        return CompileTileMesh(data, vertices, indices, counts);
+    });
+    SelectionService.Rectangle = new TileRectangleSelection();
+    ed_bind_tile_selection(function int(int op, float *data, float *selection, float *camera, float *input) {
+        return TileSelectionDispatch(op, data, selection, camera, input);
+    });
+    TileSetService.History = new Vector<TileSetEdit *>();
+    ed_bind_tilesets(function int(int operation, readonly byte *setPath, int count, readonly byte **paths,
+                                  readonly byte *name, int flags) {
+        return TileSetsDispatch(operation, setPath, count, paths, name, flags);
+    });
+    ProjectService.State = new ProjectState();
+    ed_bind_project(function int(int operation, readonly byte *path, int argument) {
+        return ProjectDispatch(operation, path, argument);
+    });
+    GizmoService.Scene = new SceneGizmo();
+    ed_bind_scene_gizmo(
+        function int(int operation, float *record, float *input, float *camera, float *state) {
+            return SceneGizmoDispatch(operation, record, input, camera, state);
+        });
+    TileGizmoService.State = new TileGizmo();
+    ed_bind_tile_gizmo(function int(int operation, float *data, float *selection, float *camera, float *input,
+                                    float *values, float *display) {
+        return TileGizmoDispatch(operation, data, selection, camera, input, values, display);
+    });
+    ed_bind_tile_assets(function int(int operation, readonly byte *tileset, readonly byte *file,
+                                     readonly byte *name, readonly byte *texture, float *data) {
+        return TileAssetsDispatch(operation, tileset, file, name, texture, data);
+    });
+    ed_bind_tile_interaction(function int(int operation, float *data, float *selection, float *camera,
+                                          float *input, float *output) {
+        return TileInteractionDispatch(operation, data, selection, camera, input, output);
+    });
+    AtlasService.State = new AtlasController();
+    AtlasService.State->Reset();
+    ed_bind_atlas(function int(int operation, float *data, float *uv, float *corners, float *input,
+                               float *values, float *display) {
+        return AtlasDispatch(operation, data, uv, corners, input, values, display);
+    });
+    ed_bind_tile_viewport(
+        function int(int operation, float *data, float *state, float *input, float *uv, float *output) {
+            return TileViewportDispatch(operation, data, state, input, uv, output);
+        });
+    WorkspaceService.Commands = new Vector<int>();
+    ed_bind_workspace_model(
+        function int(int operation, int argument, float *records, float *output, byte *text) {
+            return WorkspaceModelDispatch(operation, argument, records, output, text);
+        });
+    LayerPanelService.Forms = new LayerForms();
+    ed_bind_layers_panel(function void(float *state, float *records) { DrawLayersPanel(state, records); });
+    InspectorService.Panel = new InspectorPanel();
+    ed_bind_inspector(function int(int operation, float *state, float *records, float *values) {
+        return InspectorDispatch(operation, state, records, values);
+    });
+    HierarchyService.Panel = new HierarchyPanel();
+    ed_bind_hierarchy(
+        function void(float *state, float *records) { HierarchyService.Panel->Draw(state, records); });
+    ResourcePanelService.Panel = new ResourcesPanel();
+    ed_bind_resources(function void(float *state) { ResourcePanelService.Panel->Draw(state); });
+    ed_bind_workflow(function int(int operation, readonly byte *path, float *data, int argument) {
+        return WorkflowDispatch(operation, path, data, argument);
+    });
+    ed_bind_scene_toolbar(function void(float *state) { DrawSceneToolbar(state); });
+    ed_bind_layout(function void(int operation, int *values) { LayoutDispatch(operation, values); });
+    TilePaletteService.Panel = new TilePalette();
+    ed_bind_tile_palette(function int(int operation, float *state, int value) {
+        return TilePaletteDispatch(operation, state, value);
+    });
+    TilePanelService.Panel = new TilePanel();
+    ed_bind_tile_panel(
+        function void(int part, float *data, float *selection, float *view, float *values, byte *name) {
+            if (part == 0)
+            {
+                TilePanelService.Panel->Tools(data, selection, view, values, name);
+            }
+            if (part == 1)
+            {
+                TilePanelService.Panel->ViewportTools(view);
+            }
+            if (part == 2)
+            {
+                view[0] = cast<float>(FirstSelectedTileFace(data, selection));
+            }
+        });
+    ed_bind_atlas_panel(function int(float *data, float *uv, float *corners, float *settings, float *values) {
+        return DrawAtlasPanel(data, uv, corners, settings, values);
+    });
+    TileSessionService.Session = new TileSession();
+    ed_bind_tile_session(function int(int operation, float *data, float *selection, float *view, byte *name,
+                                      readonly byte *path) {
+        return TileSessionDispatch(operation, data, selection, view, name, path);
+    });
+    ed_bind_workspace_controller(
+        function int(int operation, int argument, float *state, readonly byte *path) {
+            return WorkspaceControllerDispatch(operation, argument, state, path);
+        });
+    ed_bind_menu_policy(function int(int action, int playing, int selected, int undo, int redo) {
+        return EditorMenuEnabled(action, playing, selected, undo, redo);
+    });
+    ed_layer_add("Layer 1");
+}
+
+void CloseEditorLogic()
+{
+    for (int i = 0; i < LayerService.History->Count; i++)
+    {
+        delete (*LayerService.History->Get(i));
+    }
+    delete (LayerService.History);
+    delete (LayerService.Layers);
+    delete (TileSessionService.Session);
+    delete (TilePanelService.Panel);
+    delete (TilePaletteService.Panel);
+    delete (ResourcePanelService.Panel);
+    delete (HierarchyService.Panel);
+    delete (InspectorService.Panel);
+    delete (LayerPanelService.Forms);
+    delete (WorkspaceService.Commands);
+    delete (AtlasService.State);
+    delete (TileGizmoService.State);
+    delete (GizmoService.Scene);
+    delete (ProjectService.State);
+    ClearTileSetHistory();
+    delete (TileSetService.History);
+    delete (SelectionService.Rectangle);
+}

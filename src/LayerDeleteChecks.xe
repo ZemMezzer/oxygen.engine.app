@@ -1,0 +1,105 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int LayerDeleteChecks()
+{
+    int failures = 0;
+    int initial = ed_layers_snapshot(0);
+    int count = ed_layer_count();
+    Document doc = Document();
+    doc.ResetHistory();
+    int source = ed_layer_add("Deletion source");
+    doc.ActiveLayer = source;
+    doc.Commit();
+    int other = ed_layer_add("Deletion destination");
+    doc.Commit();
+    doc.Restore(1);
+    if (ed_layer_count() != count + 1)
+    {
+        failures++;
+    }
+    doc.Restore(2);
+    if (ed_layer_count() != count + 2)
+    {
+        failures++;
+    }
+
+    int asset = ed_asset_find("Tiles/tile_Regression/grid-unit.oxtile");
+    doc.ActiveLayer = 0;
+    int root = doc.Add(2, Vector3(1.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    int occupied = doc.Add(6, Vector3(31.0f, 0.0f, 31.0f), 0.0f, asset, 0);
+    doc.ActiveLayer = source;
+    int parent = doc.Add(2, Vector3(5.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    int tile = doc.Add(6, Vector3(31.0f, 0.0f, 31.0f), 0.0f, asset, 0);
+    doc.Reparent(parent, root);
+    doc.ActiveLayer = other;
+    int child = doc.Add(2, Vector3(9.0f, 0.0f, 1.0f), 0.0f, 0, 0);
+    doc.Reparent(child, parent);
+    doc.ActiveLayer = source;
+    doc.ResetHistory();
+    if (doc.RemoveLayer(source, 0) || ed_layer_count() != count + 2 || doc.Count() != 5 ||
+        doc.Parent(child) != parent || doc.Data[tile * Stride + 15] != cast<float>(source))
+    {
+        Log("FAIL: occupied destination must reject layer deletion atomically.");
+        failures++;
+    }
+    if (!doc.RemoveLayer(source, -1) || doc.Count() != 3 || ed_layer_count() != count + 1 ||
+        doc.Parent(child) != root || doc.Data[child * Stride + 1] != 9.0f ||
+        doc.Data[child * Stride + 15] != cast<float>(other - 1) || doc.ActiveLayer != 0 ||
+        ed_validate_scene(&doc.Data[0]) == 0)
+    {
+        Log("FAIL: deleting a layer must preserve children belonging to other layers.");
+        failures++;
+    }
+    doc.Commit();
+    doc.Restore(0);
+    if (doc.Count() != 5 || ed_layer_count() != count + 2 || doc.Parent(child) != parent ||
+        doc.ActiveLayer != source || doc.Data[tile * Stride] == 0.0f)
+    {
+        Log("FAIL: layer Undo must restore metadata, objects and hierarchy together.");
+        failures++;
+    }
+    doc.Restore(1);
+    if (doc.Count() != 3 || ed_layer_count() != count + 1 || doc.Parent(child) != root)
+    {
+        failures++;
+    }
+    doc.Restore(0);
+    doc.Remove(occupied);
+    doc.Commit();
+    doc.ActiveLayer = other;
+    if (!doc.RemoveLayer(source, other) || doc.Count() != 4 || ed_layer_count() != count + 1 ||
+        doc.Parent(child) != parent || doc.Data[tile * Stride + 15] != cast<float>(other - 1) ||
+        doc.ActiveLayer != other - 1 || ed_validate_scene(&doc.Data[0]) == 0)
+    {
+        Log("FAIL: moving layer contents must retain objects and remap layer indices.");
+        failures++;
+    }
+    doc.Commit();
+    int empty = ed_layer_add("Deletion empty");
+    doc.ActiveLayer = empty;
+    doc.Commit();
+    int previous = doc.Cursor;
+    if (!doc.RemoveLayer(empty, -1) || doc.Count() != 4)
+    {
+        failures++;
+    }
+    doc.Commit();
+    doc.Restore(previous);
+    if (ed_layer_count() != count + 2 || doc.ActiveLayer != empty)
+    {
+        failures++;
+    }
+    ed_layers_restore(initial);
+    ed_layers_release(initial);
+    if (count == 1 && doc.RemoveLayer(0, -1))
+    {
+        failures++;
+    }
+    if (failures == 0)
+    {
+        Log("PASS: layer delete/move, collision rejection, surviving children, index remap, create/delete Undo and last-layer guard.");
+    }
+    return failures;
+}

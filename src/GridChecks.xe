@@ -1,0 +1,258 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+int GridChecks()
+{
+    int failures = GridAlignmentChecks();
+    int asset = ed_asset_find("Tiles/tile_Regression/grid-unit.oxtile");
+    if (asset == 0)
+    {
+        Log("FAIL: grid tile fixture missing.");
+        return 1;
+    }
+    int layerSnapshot = ed_layers_snapshot(0);
+    if (ed_layer_count() < 2)
+    {
+        ed_layer_add("Grid regression decorations");
+    }
+    Document doc = Document();
+    int a = doc.Add(6, Vector3(1.2f, 0.1f, 1.1f), 0.0f, asset, 0);
+    int b = doc.Add(6, Vector3(1.0f, 0.0f, 1.0f), 0.0f, asset, 0);
+    if (a < 0 || b >= 0 || doc.Data[a * Stride + 1] != 1.0f || doc.Data[a * Stride + 2] != 0.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:19.");
+        failures++;
+    }
+    int top = doc.Add(6, Vector3(1.0f, 2.0f, 1.0f), 0.0f, asset, 0);
+    int side = doc.Add(6, Vector3(3.0f, 0.0f, 1.0f), 0.0f, asset, 0);
+    if (top < 0 || side < 0)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:25.");
+        failures++;
+    }
+    doc.ActiveLayer = 1;
+    int decor = doc.Add(6, Vector3(1.0f, 0.0f, 1.0f), 0.0f, asset, 0);
+    if (decor < 0 || doc.Data[decor * Stride + 15] != 1.0f || doc.Data[decor * Stride + 10] != 0.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:31.");
+        failures++;
+    }
+    doc.ResetHistory();
+    doc.Data[decor * Stride + 15] = 0.0f;
+    if (ConstrainTileChanges(&doc.Data[0], &doc.History[0]))
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:37.");
+        failures++;
+    }
+    doc.Restore(0);
+    doc.Data[a * Stride + 1] = 3.0f;
+    if (ConstrainTileChanges(&doc.Data[0], &doc.History[0]))
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:43.");
+        failures++;
+    }
+    doc.Restore(0);
+    int copy = doc.Duplicate(a);
+    if (copy < 0 || !TileSpaceFree(&doc.Data[0], TileCells(MakePrimitive(&doc.Data[0], copy)), 0, copy))
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:49.");
+        failures++;
+    }
+    doc.Commit();
+    int count = doc.Count();
+    doc.Restore(0);
+    if (doc.Count() != count - 1)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:56.");
+        failures++;
+    }
+    doc.Restore(1);
+    if (doc.Count() != count)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:61.");
+        failures++;
+    }
+    if (doc.Add(6, Vector3(20001.0f, -20002.0f, -20003.0f), 0.0f, asset, 0) < 0)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:65.");
+        failures++;
+    }
+    if (doc.Add(6, Vector3(20001.0f, -20002.0f, -20003.0f), 0.0f, asset, 0) >= 0)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:69.");
+        failures++;
+    }
+    Primitive large = TilePlacement(asset, Vector3(1.0f, 0.0f, 1.0f), 0.0f);
+    large.Size.X = 6.0f;
+    if (TileSpaceFree(&doc.Data[0], TileCells(large), 0, a))
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:75.");
+        failures++;
+    }
+
+    Editor editor = Editor();
+    for (int i = 0; i < RecordSize; i++)
+    {
+        editor.Document.Data[i] = 0.0f;
+    }
+    editor.Document.ResetHistory();
+    int tile = editor.Document.Add(6, Vector3(1.0f, 0.0f, 1.0f), 0.0f, asset, 0);
+    // Erase targets occupied cells from the front; painting targets the adjacent cell.
+    editor.Document.ResetHistory();
+    editor.Brush = 10;
+    editor.Ray[0] = 1.0f;
+    editor.Ray[1] = 5.0f;
+    editor.Ray[2] = 1.0f;
+    editor.Ray[3] = 0.0f;
+    editor.Ray[4] = -1.0f;
+    editor.Ray[5] = 0.0f;
+    Vector3 point = Vector3(0.0f, 0.0f, 0.0f);
+    if (!editor.CellPoint(&point) || point.Y != 0.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:93.");
+        failures++;
+    }
+    editor.Brush = 6;
+    editor.TileAsset = asset;
+    editor.Stroke = true;
+    if (!editor.CellPoint(&point) || point.Y != 2.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:100.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    if (!editor.CellPoint(&point) || point.Y != 2.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:105.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    if (editor.Document.Count() != 2)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:110.");
+        failures++;
+    }
+    editor.Ray[0] = 3.0f;
+    if (!editor.CellPoint(&point) || point.X != 3.0f || point.Y != 2.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:115.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    editor.FinishStroke();
+    if (editor.Document.Count() != 3)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:121.");
+        failures++;
+    }
+    editor.Document.Restore(editor.Document.Cursor - 1);
+    if (editor.Document.Count() != 1)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:126.");
+        failures++;
+    }
+    editor.Ray[0] = 5.0f;
+    editor.Ray[1] = 1.0f;
+    editor.Ray[3] = -1.0f;
+    editor.Ray[4] = 0.0f;
+    editor.Stroke = true;
+    if (!editor.CellPoint(&point) || point.X != 3.0f || point.Y != 0.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:135.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    if (!editor.CellPoint(&point) || point.X != 3.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:140.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    if (editor.Document.Count() != 2)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:145.");
+        failures++;
+    }
+    editor.FinishStroke();
+    editor.Document.Restore(editor.Document.Cursor - 1);
+    editor.Brush = 10;
+    point = Vector3(1.0f, 0.0f, 1.0f);
+    editor.WorldLayer = 1;
+    editor.Document.ActiveLayer = 1;
+    editor.PaintCell(point);
+    editor.FinishStroke();
+    if (editor.Document.Count() != 1)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:157.");
+        failures++;
+    }
+    editor.WorldLayer = 0;
+    editor.Document.ActiveLayer = 0;
+    editor.Selected = tile;
+    editor.Action(60);
+    if (editor.Document.Data[tile * Stride + 10] != 0.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:165.");
+        failures++;
+    }
+    // Coordinates that collided in the former bounded-map key are distinct cells.
+    editor.Brush = 6;
+    editor.PaintCell(Vector3(65.0f, -2.0f, 1.0f));
+    editor.PaintCell(Vector3(1.0f, -2.0f, 2.0f));
+    editor.PaintCell(Vector3(1.0f, -2.0f, 2.0f));
+    editor.FinishStroke();
+    if (editor.Document.Count() != 3)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:175.");
+        failures++;
+    }
+    editor.Layer = 0;
+    editor.Action(40);
+    editor.Ray[0] = -20000.5f;
+    editor.Ray[1] = 5.0f;
+    editor.Ray[2] = 20000.5f;
+    editor.Ray[3] = 0.0f;
+    editor.Ray[4] = -1.0f;
+    editor.Ray[5] = 0.0f;
+    if (!editor.CellPoint(&point) || point.X != -20001.0f || point.Y != -2.0f || point.Z != 20001.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:187.");
+        failures++;
+    }
+    editor.PaintCell(point);
+    editor.FinishStroke();
+    if (editor.Document.Count() != 4)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:193.");
+        failures++;
+    }
+    editor.Brush = 1;
+    editor.Layer = 15;
+    editor.Action(41);
+    editor.Ray[1] = 40.0f;
+    if (!editor.CellPoint(&point) || point.Y != 32.0f || point.X != -20001.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:201.");
+        failures++;
+    }
+    Primitive distant = Primitive(ShapeBox, Vector3(2000001.0f, -2000000.0f, 0.0f), Vector3(2.0f, 2.0f, 2.0f),
+                                  Surface(0xFFFFFFFFu));
+    if (!ValidPrimitive(distant) || TileCells(distant).Low.X != 1000000.0f)
+    {
+        Log("FAIL: grid constraint at GridChecks.xe:207.");
+        failures++;
+    }
+    editor.Document.Dirty = false;
+    if (failures == 0)
+    {
+        Log("PASS: static grid tiles, occupancy/layers, unbounded coordinates, adjacent strokes, duplicate/Undo and layer-safe erase.");
+    }
+    else
+    {
+        Log("FAIL: static tile grid / world layers.");
+    }
+    ed_layers_restore(layerSnapshot);
+    ed_layers_release(layerSnapshot);
+    return failures;
+}

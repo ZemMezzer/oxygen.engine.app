@@ -1,0 +1,658 @@
+using Oxygen;
+
+namespace OxygenEditor;
+
+const int TileVertices = 512;
+const int TileFaces = 512;
+const int TileFaceStart = TileVertices * 4;
+const int TileFaceStride = 13;
+const int TileDataSize = TileFaceStart + TileFaces * TileFaceStride;
+
+// Editable positions, indexed faces and Undo history. Serialization is in TileCodec.xe.
+struct TileDocument
+{
+    public float[] Data;
+    public float[] Selection;
+    public float[] Values;
+    public float[] History;
+    public int Cursor;
+    public int Count;
+
+    public TileDocument()
+    {
+        Data = new float[TileDataSize];
+        Selection = new float[TileVertices];
+        Values = new float[16];
+        History = new float[TileDataSize * 32];
+        ResetHistory();
+    }
+
+    public ~TileDocument()
+    {
+        delete (Data);
+        delete (Selection);
+        delete (Values);
+        delete (History);
+    }
+
+    public void ResetHistory()
+    {
+        Cursor = 0;
+        Count = 1;
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            History[i] = Data[i];
+        }
+    }
+
+    public void Commit()
+    {
+        bool changed = false;
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            if (Data[i] != History[Cursor * TileDataSize + i])
+            {
+                changed = true;
+            }
+        }
+        if (!changed)
+        {
+            return;
+        }
+        if (Cursor == 31)
+        {
+            for (int i = 0; i < TileDataSize * 31; i++)
+            {
+                History[i] = History[i + TileDataSize];
+            }
+            Cursor--;
+        }
+        Cursor++;
+        Count = Cursor + 1;
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            History[Cursor * TileDataSize + i] = Data[i];
+        }
+    }
+
+    public void Restore(int cursor)
+    {
+        if (cursor < 0 || cursor >= Count)
+        {
+            return;
+        }
+        Cursor = cursor;
+        for (int i = 0; i < TileDataSize; i++)
+        {
+            Data[i] = History[Cursor * TileDataSize + i];
+        }
+    }
+
+    public int Vertex(Vector3 position)
+    {
+        for (int i = 0; i < TileVertices; i++)
+        {
+            int at = i * 4;
+            if (Data[at] == 0.0f)
+            {
+                Data[at] = 1.0f;
+                Data[at + 1] = position.X;
+                Data[at + 2] = position.Y;
+                Data[at + 3] = position.Z;
+                Selection[i] = 1.0f;
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public Vector3 Position(int vertex)
+    {
+        int at = vertex * 4;
+        return Vector3(Data[at + 1], Data[at + 2], Data[at + 3]);
+    }
+
+    public int Face(int a, int b, int c, int d)
+    {
+        if (a < 0 || b < 0 || c < 0 || d < 0)
+        {
+            return -1;
+        }
+        for (int i = 0; i < TileFaces; i++)
+        {
+            int at = TileFaceStart + i * TileFaceStride;
+            if (Data[at] == 0.0f)
+            {
+                Data[at] = 1.0f;
+                Data[at + 1] = cast<float>(a);
+                Data[at + 2] = cast<float>(b);
+                Data[at + 3] = cast<float>(c);
+                Data[at + 4] = cast<float>(d);
+                for (int j = 0; j < 8; j++)
+                {
+                    Data[at + 5 + j] = Values[8 + j];
+                }
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    public void ClearSelection()
+    {
+        for (int i = 0; i < TileVertices; i++)
+        {
+            Selection[i] = 0.0f;
+        }
+    }
+
+    public bool Room(int vertices, int faces)
+    {
+        int v = 0;
+        int f = 0;
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (Data[i * 4] == 0.0f)
+            {
+                v++;
+            }
+        }
+        for (int i = 0; i < TileFaces; i++)
+        {
+            if (Data[TileFaceStart + i * TileFaceStride] == 0.0f)
+            {
+                f++;
+            }
+        }
+        if (v < vertices || f < faces)
+        {
+            ed_status("Tile limit: 512 vertices and 512 faces. Remove geometry first.");
+            return false;
+        }
+        return true;
+    }
+
+    public void AddAtlasFace()
+    {
+        if (!Room(4, 1) || Values[3] <= 0.0f || Values[4] <= 0.0f)
+        {
+            return;
+        }
+        ClearSelection();
+        int[] vertices = new int[4];
+        for (int i = 0; i < 4; i++)
+        {
+            float u = -Values[3] * 0.5f;
+            float v = -Values[4] * 0.5f;
+            if (i == 1 || i == 2)
+            {
+                u = -u;
+            }
+            if (i >= 2)
+            {
+                v = -v;
+            }
+            Vector3 p = Vector3(u, v, 0.0f);
+            if (Values[5] == 1.0f)
+            {
+                p = Vector3(u, 0.0f, -v);
+            }
+            if (Values[5] == 2.0f)
+            {
+                p = Vector3(0.0f, v, -u);
+            }
+            p = Add(p, Vector3(Values[0], Values[1], Values[2]));
+            vertices[i] = Vertex(p);
+        }
+        Face(vertices[0], vertices[1], vertices[2], vertices[3]);
+        delete (vertices);
+    }
+
+    public void CollectUnused()
+    {
+        bool[] used = new bool[TileVertices];
+        for (int i = 0; i < TileFaces; i++)
+        {
+            int at = TileFaceStart + i * TileFaceStride;
+            if (Data[at] == 0.0f)
+            {
+                continue;
+            }
+            for (int j = 1; j <= 4; j++)
+            {
+                used[cast<int>(Data[at + j])] = true;
+            }
+        }
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (!used[i])
+            {
+                Data[i * 4] = 0.0f;
+                Selection[i] = 0.0f;
+            }
+        }
+        delete (used);
+    }
+
+    public bool IndependentFace(int face)
+    {
+        int at = TileFaceStart + face * TileFaceStride;
+        bool[] referencedElsewhere = new bool[4];
+        int needed = 0;
+        for (int corner = 0; corner < 4; corner++)
+        {
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int other = TileFaceStart + i * TileFaceStride;
+                if (i == face || Data[other] == 0.0f)
+                {
+                    continue;
+                }
+                for (int j = 1; j <= 4; j++)
+                {
+                    if (Data[other + j] == Data[at + 1 + corner])
+                    {
+                        referencedElsewhere[corner] = true;
+                    }
+                }
+            }
+            if (referencedElsewhere[corner])
+            {
+                needed++;
+            }
+        }
+        if (!Room(needed, 0))
+        {
+            delete (referencedElsewhere);
+            return false;
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            if (referencedElsewhere[i])
+            {
+                Data[at + 1 + i] = cast<float>(Vertex(Position(cast<int>(Data[at + 1 + i]))));
+            }
+        }
+        delete (referencedElsewhere);
+        return true;
+    }
+
+    public void Crop(int face)
+    {
+        if (face < 0 || face >= TileFaces)
+        {
+            return;
+        }
+        int at = TileFaceStart + face * TileFaceStride;
+        if (Data[at] == 0.0f || Values[1] < 0.0f || Values[2] < 0.0f || Values[3] > 1.0f ||
+            Values[4] > 1.0f || Values[3] <= Values[1] || Values[4] <= Values[2])
+        {
+            return;
+        }
+        if (!IndependentFace(face))
+        {
+            return;
+        }
+        Vector3[] positions = new Vector3[4];
+        float[] uv = new float[8];
+        for (int i = 0; i < 4; i++)
+        {
+            positions[i] = Position(cast<int>(Data[at + i + 1]));
+        }
+        for (int i = 0; i < 8; i++)
+        {
+            uv[i] = Data[at + i + 5];
+        }
+        for (int i = 0; i < 4; i++)
+        {
+            float u = Values[1];
+            float v = Values[2];
+            if (i == 1 || i == 2)
+            {
+                u = Values[3];
+            }
+            if (i >= 2)
+            {
+                v = Values[4];
+            }
+            float a = (1.0f - u) * (1.0f - v);
+            float b = u * (1.0f - v);
+            float c = u * v;
+            float d = (1.0f - u) * v;
+            Vector3 p = Add(Add(Scale(positions[0], a), Scale(positions[1], b)),
+                            Add(Scale(positions[2], c), Scale(positions[3], d)));
+            int vertex = cast<int>(Data[at + 1 + i]) * 4;
+            Data[vertex + 1] = p.X;
+            Data[vertex + 2] = p.Y;
+            Data[vertex + 3] = p.Z;
+            for (int j = 0; j < 2; j++)
+            {
+                Data[at + 5 + i * 2 + j] = uv[j] * a + uv[2 + j] * b + uv[4 + j] * c + uv[6 + j] * d;
+            }
+        }
+        delete (positions);
+        delete (uv);
+    }
+
+    // Evaluate every gizmo frame from the committed baseline, avoiding accumulated drift.
+
+    public void TransformGesture()
+    {
+        Restore(Cursor);
+        Vector3 pivot = Vector3(Values[9], Values[10], Values[11]);
+        Quaternion rotation =
+            RotationEuler(Vector3(Values[3] * Pi / 180.0f, Values[4] * Pi / 180.0f, Values[5] * Pi / 180.0f));
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (Selection[i] == 0.0f || Data[i * 4] == 0.0f)
+            {
+                continue;
+            }
+            Vector3 offset = Subtract(Position(i), pivot);
+            offset = Vector3(offset.X * Values[6], offset.Y * Values[7], offset.Z * Values[8]);
+            Vector3 result =
+                Add(Add(pivot, Rotate(rotation, offset)), Vector3(Values[0], Values[1], Values[2]));
+            Data[i * 4 + 1] = Clamp(result.X, -1000.0f, 1000.0f);
+            Data[i * 4 + 2] = Clamp(result.Y, -1000.0f, 1000.0f);
+            Data[i * 4 + 3] = Clamp(result.Z, -1000.0f, 1000.0f);
+        }
+        if (Values[15] != 0.0f)
+        {
+            Commit();
+        }
+    }
+
+    public int DuplicateFaces()
+    {
+        bool[] faces = new bool[TileFaces];
+        int[] copies = new int[TileVertices];
+        for (int i = 0; i < TileVertices; i++)
+        {
+            copies[i] = -1;
+        }
+        int neededFaces = 0;
+        int neededVertices = 0;
+        for (int i = 0; i < TileFaces; i++)
+        {
+            int at = TileFaceStart + i * TileFaceStride;
+            bool selected = Data[at] != 0.0f;
+            for (int j = 1; j <= 4; j++)
+            {
+                if (Selection[cast<int>(Data[at + j])] == 0.0f)
+                {
+                    selected = false;
+                }
+            }
+            faces[i] = selected;
+            if (!selected)
+            {
+                continue;
+            }
+            neededFaces++;
+            for (int j = 1; j <= 4; j++)
+            {
+                int vertex = cast<int>(Data[at + j]);
+                if (copies[vertex] == -1)
+                {
+                    copies[vertex] = -2;
+                    neededVertices++;
+                }
+            }
+        }
+        // Preflight the entire selection, so a full tile never receives a partial copy.
+        if (neededFaces == 0 || !Room(neededVertices, neededFaces))
+        {
+            delete (faces);
+            delete (copies);
+            return -1;
+        }
+        ClearSelection();
+        for (int i = 0; i < TileVertices; i++)
+        {
+            if (copies[i] == -2)
+            {
+                copies[i] = Vertex(Position(i));
+            }
+        }
+        int first = -1;
+        for (int i = 0; i < TileFaces; i++)
+        {
+            if (!faces[i])
+            {
+                continue;
+            }
+            int source = TileFaceStart + i * TileFaceStride;
+            int copy = Face(copies[cast<int>(Data[source + 1])], copies[cast<int>(Data[source + 2])],
+                            copies[cast<int>(Data[source + 3])], copies[cast<int>(Data[source + 4])]);
+            int target = TileFaceStart + copy * TileFaceStride;
+            for (int j = 5; j < TileFaceStride; j++)
+            {
+                Data[target + j] = Data[source + j];
+            }
+            if (first < 0)
+            {
+                first = copy;
+            }
+        }
+        delete (faces);
+        delete (copies);
+        return first;
+    }
+
+    public void Edit(int action)
+    {
+        if (action == 27)
+        {
+            bool[] removed = new bool[TileVertices];
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int at = TileFaceStart + i * TileFaceStride;
+                bool selected = Data[at] != 0.0f;
+                for (int j = 1; j <= 4; j++)
+                {
+                    if (Selection[cast<int>(Data[at + j])] == 0.0f)
+                    {
+                        selected = false;
+                    }
+                }
+                if (selected)
+                {
+                    Data[at] = 0.0f;
+                    for (int j = 1; j <= 4; j++)
+                    {
+                        removed[cast<int>(Data[at + j])] = true;
+                    }
+                }
+            }
+            // Preserve shared vertices and unrelated loose vertices in the document.
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int at = TileFaceStart + i * TileFaceStride;
+                if (Data[at] != 0.0f)
+                {
+                    for (int j = 1; j <= 4; j++)
+                    {
+                        removed[cast<int>(Data[at + j])] = false;
+                    }
+                }
+            }
+            for (int i = 0; i < TileVertices; i++)
+            {
+                if (removed[i])
+                {
+                    Data[i * 4] = 0.0f;
+                }
+            }
+            delete (removed);
+            ClearSelection();
+        }
+        if (action == 2)
+        {
+            AddAtlasFace();
+        }
+        if (action == 26)
+        {
+            DuplicateFaces();
+        }
+        if (action == 22)
+        {
+            Crop(cast<int>(Values[0]));
+        }
+        if (action == 7)
+        {
+            for (int i = 0; i < TileVertices; i++)
+            {
+                if (Selection[i] != 0.0f)
+                {
+                    Data[i * 4] = 0.0f;
+                }
+            }
+            for (int i = 0; i < TileFaces; i++)
+            {
+                int at = TileFaceStart + i * TileFaceStride;
+                for (int j = 1; j <= 4; j++)
+                {
+                    if (Data[cast<int>(Data[at + j]) * 4] == 0.0f)
+                    {
+                        Data[at] = 0.0f;
+                    }
+                }
+            }
+            ClearSelection();
+        }
+        if (action >= 8 && action <= 10)
+        {
+            Vector3 low = Vector3(10000.0f, 10000.0f, 10000.0f);
+            Vector3 high = Vector3(-10000.0f, -10000.0f, -10000.0f);
+            for (int i = 0; i < TileVertices; i++)
+            {
+                if (Selection[i] != 0.0f && Data[i * 4] != 0.0f)
+                {
+                    Vector3 p = Position(i);
+                    low = Vector3(Min(low.X, p.X), Min(low.Y, p.Y), Min(low.Z, p.Z));
+                    high = Vector3(Max(high.X, p.X), Max(high.Y, p.Y), Max(high.Z, p.Z));
+                }
+            }
+            Vector3 center = Scale(Add(low, high), 0.5f);
+            Quaternion rotation = RotationEuler(
+                Vector3(Values[0] * Pi / 180.0f, Values[1] * Pi / 180.0f, Values[2] * Pi / 180.0f));
+            for (int i = 0; i < TileVertices; i++)
+            {
+                if (Selection[i] == 0.0f || Data[i * 4] == 0.0f)
+                {
+                    continue;
+                }
+                Vector3 p = Position(i);
+                if (action == 8)
+                {
+                    p = Add(p, Vector3(Values[0], Values[1], Values[2]));
+                }
+                if (action == 9)
+                {
+                    p = Subtract(p, center);
+                    p = Add(center, Vector3(p.X * Values[0], p.Y * Values[1], p.Z * Values[2]));
+                }
+                if (action == 10)
+                {
+                    p = Add(center, Rotate(rotation, Subtract(p, center)));
+                }
+                Data[i * 4 + 1] = Clamp(p.X, -1000.0f, 1000.0f);
+                Data[i * 4 + 2] = Clamp(p.Y, -1000.0f, 1000.0f);
+                Data[i * 4 + 3] = Clamp(p.Z, -1000.0f, 1000.0f);
+            }
+        }
+        int face = cast<int>(Values[0]);
+        if (action >= 12 && action <= 14 && face >= 0 && face < TileFaces)
+        {
+            int at = TileFaceStart + face * TileFaceStride;
+            if (action == 12)
+            {
+                for (int j = 0; j < 8; j++)
+                {
+                    Data[at + 5 + j] = Values[8 + j];
+                }
+            }
+            if (action == 13)
+            {
+                int opposite = 4;
+                if (Data[at + 3] == Data[at + 4])
+                {
+                    opposite = 3;
+                }
+                float temp = Data[at + 2];
+                Data[at + 2] = Data[at + opposite];
+                Data[at + opposite] = temp;
+                for (int j = 0; j < 2; j++)
+                {
+                    temp = Data[at + 7 + j];
+                    Data[at + 7 + j] = Data[at + 5 + (opposite - 1) * 2 + j];
+                    Data[at + 5 + (opposite - 1) * 2 + j] = temp;
+                }
+                if (opposite == 3)
+                {
+                    Data[at + 4] = Data[at + 3];
+                    Data[at + 11] = Data[at + 9];
+                    Data[at + 12] = Data[at + 10];
+                }
+            }
+            if (action == 14)
+            {
+                Data[at] = 0.0f;
+                CollectUnused();
+            }
+        }
+    }
+
+    public void Update()
+    {
+        int action = ed_tile_ui(&Data[0], &Selection[0], Cursor, Count);
+        ed_tile_values(&Values[0]);
+        if (action == 1)
+        {
+            for (int i = 0; i < TileDataSize; i++)
+            {
+                Data[i] = 0.0f;
+            }
+            ClearSelection();
+            ResetHistory();
+        }
+        else if (action == 23)
+        {
+            ClearSelection();
+            ResetHistory();
+        }
+        else if (action == 15)
+        {
+            Edit(8);
+        }
+        else if (action == 25)
+        {
+            TransformGesture();
+        }
+        else if (action == 24)
+        {
+            Edit(12);
+        }
+        else if (action == 16)
+        {
+            Commit();
+        }
+        else if (action == 17)
+        {
+            Restore(Cursor);
+        }
+        else if (action == 20)
+        {
+            Restore(Cursor - 1);
+        }
+        else if (action == 21)
+        {
+            Restore(Cursor + 1);
+        }
+        else if ((action >= 2 && action <= 14) || action == 22 || action == 26 || action == 27)
+        {
+            Edit(action);
+            Commit();
+        }
+    }
+}

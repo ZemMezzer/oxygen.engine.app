@@ -20,7 +20,7 @@ extern "C" int ed_mouse(int);
 extern "C" int ed_pick(const float *, float, float, float, float, float, float, float, float, float, float *);
 namespace
 {
-constexpr int stride = 15;
+constexpr int stride = 16;
 Camera3D camera{};
 Rectangle viewport{};
 bool drawn = false;
@@ -28,16 +28,37 @@ int shownMode = 0;
 Vector2 framePress{};
 bool framePressed = false;
 Color colors[] = {{235, 85, 85, 255}, {103, 219, 137, 255}, {90, 160, 255, 255}};
+// Display/test projection of the Xenon gesture; no transform algorithm lives here.
 struct Drag
 {
     float *record = nullptr;
-    std::array<float, stride> before{};
     int mode = 0, handle = 0;
-    Vector3 pivot{}, direction{}, plane{}, start{}, axes[3]{};
-    Vector2 mouse{};
-    float length = 1, angle = 0;
-    bool screenRotation = false;
+    Vector3 start{};
 } drag;
+using SceneGizmoCallback = int (*)(int, float *, float *, float *, float *);
+SceneGizmoCallback sceneGizmoCallback = nullptr;
+int dispatchGizmo(int operation, float *record, float x = 0, float y = 0, float mode = 0, float handle = 0,
+                  bool snap = false)
+{
+    float context[]{camera.position.x, camera.position.y, camera.position.z, camera.target.x, camera.target.y,
+                    camera.target.z,   camera.up.x,       camera.up.y,       camera.up.z,     camera.fovy,
+                    viewport.x,        viewport.y,        viewport.width,    viewport.height};
+    float input[]{x, y, mode, handle, snap ? 1.f : 0.f};
+    float state[6]{};
+    int result = sceneGizmoCallback(operation, record, input, context, state);
+    if (operation == 1 && result)
+    {
+        drag.record = record;
+    }
+    if (!state[0])
+    {
+        drag.record = nullptr;
+    }
+    drag.mode = (int)state[1];
+    drag.handle = (int)state[2];
+    drag.start = {state[3], state[4], state[5]};
+    return result;
+}
 
 Vector3 center(const float *r)
 {
@@ -75,32 +96,6 @@ bool visible(Vector3 p)
 {
     return viewport.width > 0 && Vector3DotProduct(Vector3Subtract(p, camera.position), forward()) > .05f;
 }
-bool intersect(Ray ray, Vector3 origin, Vector3 normal, Vector3 &hit)
-{
-    float denominator = Vector3DotProduct(ray.direction, normal);
-    if (std::fabs(denominator) < .0001f)
-    {
-        return false;
-    }
-    float t = Vector3DotProduct(Vector3Subtract(origin, ray.position), normal) / denominator;
-    if (!std::isfinite(t) || t < 0 || t > 100000)
-    {
-        return false;
-    }
-    hit = Vector3Add(ray.position, Vector3Scale(ray.direction, t));
-    return true;
-}
-float segmentDistance(Vector2 p, Vector2 a, Vector2 b)
-{
-    Vector2 d = Vector2Subtract(b, a);
-    float length = Vector2LengthSqr(d);
-    if (length < .001f)
-    {
-        return Vector2Distance(p, a);
-    }
-    float t = std::clamp(Vector2DotProduct(Vector2Subtract(p, a), d) / length, 0.f, 1.f);
-    return Vector2Distance(p, Vector2Add(a, Vector2Scale(d, t)));
-}
 void axesFor(const float *r, int mode, Vector3 *axes)
 {
     for (int i = 0; i < 3; i++)
@@ -116,254 +111,31 @@ Vector3 ringPoint(Vector3 pivot, int index, float angle, float radius)
 }
 int hover(const float *r, int mode, Vector2 mouse)
 {
-    Vector3 pivot = center(r);
-    if (!visible(pivot) || !CheckCollisionPointRec(mouse, viewport))
-    {
-        return 0;
-    }
-    float length = handleLength(pivot);
-    Vector3 axes[3];
-    axesFor(r, mode, axes);
-    if (mode != 2 && Vector2Distance(mouse, project(pivot)) < 8)
-    {
-        return 7;
-    }
-    int result = 0;
-    float best = 9;
-    if (mode == 2)
-    {
-        for (int a = 0; a < 3; a++)
-        {
-            Vector2 previous = project(ringPoint(pivot, a, 0, length));
-            for (int i = 1; i <= 96; i++)
-            {
-                Vector2 next = project(ringPoint(pivot, a, (float)i * 2 * PI / 96, length));
-                float distance = segmentDistance(mouse, previous, next);
-                if (distance < best)
-                {
-                    best = distance;
-                    result = a + 1;
-                }
-                previous = next;
-            }
-        }
-        return result;
-    }
-    for (int a = 0; a < 3; a++)
-    {
-        Vector2 start = project(Vector3Add(pivot, Vector3Scale(axes[a], length * .18f)));
-        Vector2 end = project(Vector3Add(pivot, Vector3Scale(axes[a], length)));
-        if (Vector2Distance(start, end) < 16)
-        {
-            continue;
-        }
-        float distance = segmentDistance(mouse, start, end);
-        if (distance < best)
-        {
-            best = distance;
-            result = a + 1;
-        }
-    }
-    if (result || mode != 1)
-    {
-        return result;
-    }
-    for (int a = 0; a < 3; a++)
-    {
-        int b = (a + 1) % 3;
-        Vector3 hit;
-        if (!intersect(mouseRay(mouse), pivot, Vector3CrossProduct(axes[a], axes[b]), hit))
-        {
-            continue;
-        }
-        Vector3 local = Vector3Scale(Vector3Subtract(hit, pivot), 1 / length);
-        float x = Vector3DotProduct(local, axes[a]), y = Vector3DotProduct(local, axes[b]);
-        if (x >= .22f && x <= .43f && y >= .22f && y <= .43f)
-        {
-            return 4 + a;
-        }
-    }
-    return 0;
+    return dispatchGizmo(0, const_cast<float *>(r), mouse.x, mouse.y, (float)mode);
 }
 bool begin(float *r, int mode, int handle, Vector2 mouse)
 {
-    drag = {};
-    drag.record = r;
-    drag.mode = mode;
-    drag.handle = handle;
-    std::copy(r, r + stride, drag.before.begin());
-    drag.pivot = center(r);
-    drag.length = handleLength(drag.pivot);
-    drag.mouse = mouse;
-    axesFor(r, mode, drag.axes);
-    if (handle <= 3)
-    {
-        drag.direction = drag.axes[handle - 1];
-        drag.plane =
-            mode == 2
-                ? drag.direction
-                : Vector3Subtract(forward(),
-                                  Vector3Scale(drag.direction, Vector3DotProduct(forward(), drag.direction)));
-        if (Vector3LengthSqr(drag.plane) < .0001f)
-        {
-            drag = {};
-            return false;
-        }
-        drag.plane = Vector3Normalize(drag.plane);
-    }
-    else if (handle < 7)
-    {
-        int a = handle - 4;
-        drag.plane = Vector3CrossProduct(drag.axes[a], drag.axes[(a + 1) % 3]);
-    }
-    else
-    {
-        drag.plane = forward();
-    }
-    if (mode == 2 && std::fabs(Vector3DotProduct(drag.plane, mouseRay(mouse).direction)) < .12f)
-    {
-        // Edge-on rings cannot define a stable ray/plane intersection. Use their projected tangent.
-        drag.screenRotation = true;
-    }
-    if (!drag.screenRotation && !(mode == 3 && handle == 7) &&
-        !intersect(mouseRay(mouse), drag.pivot, drag.plane, drag.start))
-    {
-        drag = {};
-        return false;
-    }
-    return true;
-}
-float snapped(float value, float step, bool snap)
-{
-    return snap ? std::round(value / step) * step : value;
+    return dispatchGizmo(1, r, mouse.x, mouse.y, (float)mode, (float)handle) != 0;
 }
 void applyTranslation(Vector3 delta, bool snap)
 {
-    float *r = drag.record;
-    r[1] = std::clamp(drag.before[1] + snapped(delta.x, .25f, snap), -10000.f, 10000.f);
-    r[2] = std::clamp(drag.before[2] + snapped(delta.y, .25f, snap), -10000.f, 10000.f);
-    r[3] = std::clamp(drag.before[3] + snapped(delta.z, .25f, snap), -10000.f, 10000.f);
+    dispatchGizmo(4, nullptr, delta.x, delta.y, delta.z, 0, snap);
 }
 void applyRotation(float angle, bool snap)
 {
-    angle = snapped(angle, 15 * DEG2RAD, snap);
-    if (std::fabs(angle) < .0000001f)
-    {
-        // Keep the author's Euler representation on a click or a snapped return to zero.
-        drag.record[12] = drag.before[12];
-        drag.record[4] = drag.before[4];
-        drag.record[13] = drag.before[13];
-        return;
-    }
-    Quaternion rotation =
-        QuaternionMultiply(QuaternionFromAxisAngle(drag.direction, angle), orientation(drag.before.data()));
-    Vector3 euler = QuaternionToEuler(QuaternionNormalize(rotation));
-    drag.record[12] = euler.x * RAD2DEG;
-    drag.record[4] = euler.y * RAD2DEG;
-    drag.record[13] = euler.z * RAD2DEG;
+    dispatchGizmo(5, nullptr, angle, 0, 0, 0, snap);
 }
 void applyScale(float factor, bool snap)
 {
-    factor = 1 + snapped(factor - 1, .1f, snap);
-    bool affected[3]{};
-    int kind = (int)drag.before[0];
-    if (drag.handle == 7 || kind >= 7)
-    {
-        affected[0] = affected[1] = affected[2] = true;
-    }
-    else
-    {
-        affected[drag.handle - 1] = true;
-        if (kind == 5 && drag.handle != 2)
-        {
-            affected[0] = affected[2] = true;
-        }
-    }
-    float low = 0, high = 1e8f;
-    for (int a = 0; a < 3; a++)
-    {
-        if (affected[a])
-        {
-            low = std::max(low, .02f / drag.before[5 + a]);
-            high = std::min(high, 1000.f / drag.before[5 + a]);
-        }
-    }
-    factor = std::clamp(factor, low, high);
-    for (int a = 0; a < 3; a++)
-    {
-        drag.record[5 + a] = std::clamp(drag.before[5 + a] * (affected[a] ? factor : 1), .02f, 1000.f);
-    }
-    // Authoring records store the unrotated lower face; manipulating scale keeps the visual pivot fixed.
-    drag.record[2] = factor == 1 ? drag.before[2] : drag.pivot.y - drag.record[6] * .5f;
+    dispatchGizmo(6, nullptr, factor, 0, 0, 0, snap);
 }
 void update(Vector2 mouse, bool snap)
 {
-    Vector3 hit{};
-    if (drag.mode == 2)
-    {
-        if (drag.screenRotation)
-        {
-            Vector2 screen = project(drag.pivot);
-            Vector2 radial = Vector2Normalize(Vector2Subtract(drag.mouse, screen));
-            Vector2 tangent{-radial.y, radial.x};
-            float sign = Vector3DotProduct(drag.direction, forward()) > 0 ? -1.f : 1.f;
-            drag.angle = sign * Vector2DotProduct(Vector2Subtract(mouse, drag.mouse), tangent) * .015f;
-        }
-        else if (intersect(mouseRay(mouse), drag.pivot, drag.plane, hit))
-        {
-            Vector3 a = Vector3Normalize(Vector3Subtract(drag.start, drag.pivot));
-            Vector3 b = Vector3Normalize(Vector3Subtract(hit, drag.pivot));
-            float next = std::atan2(Vector3DotProduct(drag.direction, Vector3CrossProduct(a, b)),
-                                    Vector3DotProduct(a, b));
-            drag.angle += next;
-            drag.start = hit;
-        }
-        applyRotation(drag.angle, snap);
-        return;
-    }
-    if (drag.mode == 3 && drag.handle == 7)
-    {
-        applyScale(std::exp((mouse.x - drag.mouse.x - mouse.y + drag.mouse.y) * .008f), snap);
-        return;
-    }
-    if (!intersect(mouseRay(mouse), drag.pivot, drag.plane, hit))
-    {
-        return;
-    }
-    Vector3 delta = Vector3Subtract(hit, drag.start);
-    if (drag.mode == 3)
-    {
-        applyScale(1 + Vector3DotProduct(delta, drag.direction) / drag.length, snap);
-    }
-    else
-    {
-        if (drag.handle <= 3)
-        {
-            delta = Vector3Scale(drag.direction, Vector3DotProduct(delta, drag.direction));
-        }
-        applyTranslation(delta, snap);
-    }
+    dispatchGizmo(3, nullptr, mouse.x, mouse.y, 0, 0, snap);
 }
 int finish(bool cancel)
 {
-    if (!drag.record)
-    {
-        return 0;
-    }
-    bool changed = false;
-    for (int i = 0; i < stride; i++)
-    {
-        if (std::fabs(drag.record[i] - drag.before[i]) > .00001f)
-        {
-            changed = true;
-        }
-    }
-    if (cancel)
-    {
-        std::copy(drag.before.begin(), drag.before.end(), drag.record);
-    }
-    drag = {};
-    return cancel ? 4 : changed ? 2 : 3;
+    return dispatchGizmo(2, nullptr, 0, 0, 0, 0, cancel);
 }
 void line(Vector3 a, Vector3 b, float width, Color color)
 {
@@ -371,6 +143,10 @@ void line(Vector3 a, Vector3 b, float width, Color color)
 }
 } // namespace
 
+API void ed_bind_scene_gizmo(SceneGizmoCallback callback)
+{
+    sceneGizmoCallback = callback;
+}
 API void ed_gizmo_init()
 {
 }
@@ -403,33 +179,30 @@ API int ed_gizmo_finish(int cancel)
 // 0: not consumed; 1: dragging; 2: commit; 3: unchanged release; 4: cancelled.
 API int ed_gizmo_update(float *record, int mode, int snap, int cancel)
 {
-    if (drag.record)
-    {
-        if (cancel || ImGui::GetIO().AppFocusLost || drag.record != record || drag.mode != mode ||
-            ImGui::IsMouseClicked(1))
-        {
-            return finish(true);
-        }
-        // Mouse can leave the viewport during a drag. Release is still observed globally.
-        update(ed_pointer(), snap != 0);
-        if (!ImGui::IsMouseDown(0))
-        {
-            return finish(false);
-        }
-        return 1;
-    }
-    if (cancel || !record || mode < 1 || mode > 3 || !framePressed)
-    {
-        return 0;
-    }
-    framePressed = false;
-    int handle = hover(record, mode, framePress);
-    if (!handle || !begin(record, mode, handle, framePress))
-    {
-        return 0;
-    }
-    update(ed_pointer(), snap != 0);
-    return ImGui::IsMouseDown(0) ? 1 : finish(false);
+    Vector2 mouse = ed_pointer();
+    float context[]{camera.position.x, camera.position.y, camera.position.z, camera.target.x, camera.target.y,
+                    camera.target.z,   camera.up.x,       camera.up.y,       camera.up.z,     camera.fovy,
+                    viewport.x,        viewport.y,        viewport.width,    viewport.height};
+    float input[]{mouse.x,
+                  mouse.y,
+                  (float)mode,
+                  0,
+                  snap ? 1.f : 0.f,
+                  cancel ? 1.f : 0.f,
+                  ImGui::GetIO().AppFocusLost ? 1.f : 0.f,
+                  framePressed ? 1.f : 0.f,
+                  framePress.x,
+                  framePress.y,
+                  ImGui::IsMouseClicked(1) ? 1.f : 0.f,
+                  ImGui::IsMouseDown(0) ? 1.f : 0.f};
+    float state[6]{};
+    int result = sceneGizmoCallback(7, record, input, context, state);
+    framePressed = input[7] != 0;
+    drag.record = state[0] != 0 ? record : nullptr;
+    drag.mode = (int)state[1];
+    drag.handle = (int)state[2];
+    drag.start = {state[3], state[4], state[5]};
+    return result;
 }
 API void ed_object_outline(const float *r)
 {
@@ -596,6 +369,12 @@ API int ed_gizmo_tests()
     check(finish(true) == 4 && object == initial, "Esc restores exact record");
     begin(object.data(), 1, 1, project({1, 1, 0}));
     check(finish(false) == 3, "click produces no Undo item");
+    object = initial;
+    check(begin(object.data(), 1, 1, project({1, 1, 0})), "begin unbounded translation");
+    applyTranslation({20001, -20002, -20003}, false);
+    check(object[1] == 20001 && object[2] == -20002 && object[3] == -20003,
+          "translation beyond former coordinate limits");
+    finish(true);
     object = initial;
     object[4] = 270;
     object[12] = 90;

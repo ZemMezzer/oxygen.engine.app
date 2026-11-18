@@ -1,0 +1,271 @@
+using Xenon.Text;
+using Xenon.Collections;
+
+namespace OxygenEditor;
+
+// Authoritative editor metadata. Native views only receive a read-only projection.
+struct WorldLayer
+{
+    public String Name;
+    public int Flags;
+
+    public WorldLayer(String name, int flags)
+    {
+        Name = name;
+        Flags = flags;
+    }
+}
+
+struct LayerHistory
+{
+    public int Id;
+    public int Active;
+    public Vector<WorldLayer> Layers;
+}
+
+static struct LayerService
+{
+    public static Vector<WorldLayer> *Layers;
+    public static Vector<LayerHistory *> *History;
+    public static int NextId;
+}
+
+extern void ed_layers_view_begin();
+extern void ed_layers_view_item(readonly byte *name, int flags);
+extern void ed_bind_layers(function int(int, int, int, readonly byte *) * callback);
+
+void PublishLayers()
+{
+    ed_layers_view_begin();
+    for (int i = 0; i < LayerService.Layers->Count; i++)
+    {
+        WorldLayer *layer = LayerService.Layers->Get(i);
+        ed_layers_view_item(layer->Name.CString, layer->Flags);
+    }
+}
+
+String CleanLayerName(readonly byte *input)
+{
+    if (input == null)
+    {
+        return String();
+    }
+    String value = String(input);
+    int first = 0;
+    int last = value.ByteLength;
+    while (first < last && (value.CString[first] == cast<byte>(32) || value.CString[first] == cast<byte>(9) ||
+                            value.CString[first] == cast<byte>(10) || value.CString[first] == cast<byte>(13)))
+    {
+        first++;
+    }
+    while (last > first &&
+           (value.CString[last - 1] == cast<byte>(32) || value.CString[last - 1] == cast<byte>(9) ||
+            value.CString[last - 1] == cast<byte>(10) || value.CString[last - 1] == cast<byte>(13)))
+    {
+        last--;
+    }
+    return String(value.CString + first, last - first);
+}
+
+bool ValidLayerName(readonly String &name, int except)
+{
+    if (name.ByteLength == 0 || name.ByteLength > 120)
+    {
+        return false;
+    }
+    for (int i = 0; i < name.ByteLength; i++)
+    {
+        if (name.CString[i] < cast<byte>(32) || name.CString[i] == cast<byte>(127))
+        {
+            return false;
+        }
+    }
+    for (int i = 0; i < LayerService.Layers->Count; i++)
+    {
+        if (i != except && LayerService.Layers->Get(i)->Name.Equals(name))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+int ed_layer_count()
+{
+    return LayerService.Layers->Count;
+}
+
+int LayerFlags(int index)
+{
+    if (index < 0 || index >= ed_layer_count())
+    {
+        return 3;
+    }
+    return LayerService.Layers->Get(index)->Flags;
+}
+
+int ed_layer_visible(int index)
+{
+    if ((LayerFlags(index) & 1) == 0)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+int ed_layer_editable(int index)
+{
+    if (LayerFlags(index) == 0)
+    {
+        return 1;
+    }
+    return 0;
+}
+
+int ed_layer_add(readonly byte *input)
+{
+    String name = CleanLayerName(input);
+    if (ed_layer_count() >= 4096 || !ValidLayerName(name, -1))
+    {
+        return -1;
+    }
+    LayerService.Layers->Add(WorldLayer(name, 0));
+    PublishLayers();
+    return ed_layer_count() - 1;
+}
+
+int ed_layer_rename(int index, readonly byte *input)
+{
+    if (index < 0 || index >= ed_layer_count())
+    {
+        return 0;
+    }
+    String name = CleanLayerName(input);
+    if (!ValidLayerName(name, index))
+    {
+        return 0;
+    }
+    LayerService.Layers->Get(index)->Name = name;
+    PublishLayers();
+    return 1;
+}
+
+int ed_layer_set_flags(int index, int flags)
+{
+    if (index < 0 || index >= ed_layer_count() || flags < 0 || flags > 3)
+    {
+        return 0;
+    }
+    LayerService.Layers->Get(index)->Flags = flags;
+    PublishLayers();
+    return 1;
+}
+
+int ed_layer_remove(int index)
+{
+    if (ed_layer_count() <= 1 || index < 0 || index >= ed_layer_count())
+    {
+        return 0;
+    }
+    LayerService.Layers->RemoveAt(index);
+    PublishLayers();
+    return 1;
+}
+
+int ed_layers_snapshot(int active)
+{
+    LayerHistory *snapshot = new LayerHistory();
+    snapshot->Id = ++LayerService.NextId;
+    snapshot->Active = active;
+    for (int i = 0; i < ed_layer_count(); i++)
+    {
+        snapshot->Layers.Add(*LayerService.Layers->Get(i));
+    }
+    LayerService.History->Add(snapshot);
+    return snapshot->Id;
+}
+
+int ed_layers_restore(int id)
+{
+    for (int i = 0; i < LayerService.History->Count; i++)
+    {
+        LayerHistory *snapshot = *LayerService.History->Get(i);
+        if (snapshot->Id == id)
+        {
+            LayerService.Layers->Clear();
+            for (int j = 0; j < snapshot->Layers.Count; j++)
+            {
+                LayerService.Layers->Add(*snapshot->Layers.Get(j));
+            }
+            PublishLayers();
+            return snapshot->Active;
+        }
+    }
+    return -1;
+}
+
+void ed_layers_release(int id)
+{
+    for (int i = 0; i < LayerService.History->Count; i++)
+    {
+        LayerHistory *snapshot = *LayerService.History->Get(i);
+        if (snapshot->Id == id)
+        {
+            LayerService.History->RemoveAt(i);
+            delete (snapshot);
+            return;
+        }
+    }
+}
+
+int LayersDispatch(int operation, int index, int value, readonly byte *text)
+{
+    if (operation == 1)
+    {
+        return ed_layer_add(text);
+    }
+    if (operation == 2)
+    {
+        return ed_layer_rename(index, text);
+    }
+    if (operation == 3)
+    {
+        return ed_layer_set_flags(index, value);
+    }
+    if (operation == 4)
+    {
+        return ed_layer_remove(index);
+    }
+    if (operation == 5)
+    {
+        return ed_layers_snapshot(index);
+    }
+    if (operation == 6)
+    {
+        return ed_layers_restore(index);
+    }
+    if (operation == 7)
+    {
+        ed_layers_release(index);
+        return 1;
+    }
+    if (operation == 8)
+    {
+        LayerService.Layers->Clear();
+        PublishLayers();
+        return 1;
+    }
+    return 0;
+}
+
+bool ContainsLayerName(Vector<WorldLayer> *layers, readonly String &name)
+{
+    for (int i = 0; i < layers->Count; i++)
+    {
+        if (layers->Get(i)->Name.Equals(name))
+        {
+            return true;
+        }
+    }
+    return false;
+}
